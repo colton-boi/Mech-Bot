@@ -518,7 +518,6 @@ def run(make_bot: Any) -> None:
             except queue.Empty:
                 break
         latest = None
-        skipped_kills = 0  # kill events in observations that the newest one superseded
         for raw in batch:
             if raw is None:
                 return
@@ -536,15 +535,14 @@ def run(make_bot: Any) -> None:
                 name = getattr(bot, "name", None) or getattr(make_bot, "__name__", "bot")
                 _send({"type": "ready", "name": str(name)[:32]})
             elif kind == "obs":
-                if latest is not None:
-                    skipped_kills += sum(1 for e in latest.get("events") or [] if e.get("type") == "kill")
                 latest = msg
             elif kind == "end":
+                hook = getattr(bot, "on_end", None)
+                if hook is not None:
+                    hook(msg)
                 return
         if latest is None:
             continue
-        if skipped_kills:
-            latest["skipped_kills"] = skipped_kills
         action: Dict[str, Any] = {}
         draw.clear()
         if bot is not None:
