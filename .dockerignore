@@ -1,2 +1,5 @@
-target
 .git
+__pycache__
+*.pyc
+.venv
+tools
