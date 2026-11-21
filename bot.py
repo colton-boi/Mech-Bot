@@ -24,6 +24,15 @@ PARAMS = {
         "roof": {"states": ["ESCAPE", "DODGE", "CLIMB", "PERCH", "ROTATE", "HOLD"], "fire": "attacked", "spot": "cover"},
         "aggro": {"states": ["ESCAPE", "DODGE", "FIGHT", "LOOT", "FARM", "HUNT", "ROTATE", "HOLD"],
                   "fire": "any", "spot": "cover"},
+        # standoff kiting: orbit the nearest enemy at a range set by loadout, dodge bullets, hold fire to regen
+        # when hurt and unpressed, shoot crates in quiet moments, otherwise sit in the next circle
+        "kite": {"states": ["ESCAPE", "DODGE", "KITE", "LOOT", "CRATE", "CENTER"], "fire": "any", "spot": "cover",
+                 "weapon_pref": ["laser", "lightning"],
+                 "upgrade_pref": ["nanites", "armor", "plating", "laser_damage", "servos", "gun_damage", "gun_rate",
+                                  "laser_charge", "lightning_efficiency", "gyros", "reactor", "capacitor",
+                                  "lightning_range", "gun_velocity", "gun_mag", "sensors", "jets",
+                                  "lightning_chain", "laser_pierce", "mortar_reload", "mortar_splash",
+                                  "mortar_velocity"]},
     },
     # zone
     "zone_margin": 30.0, "zone_margin_frac": 0.4, "zone_slack_s": 10.0,
@@ -40,7 +49,7 @@ PARAMS = {
     "drop_max_dist": 170.0, "drop_enemy_clear": 60.0,
     "farm_range": 75.0, "farm_min_hp": 0.75, "farm_until_t": 200.0,
     "weapon_pref": ["lightning", "laser", "mortar"],
-    "weapon_skip": {"aggro": ["mortar"]},
+    "weapon_skip": {"aggro": ["mortar"], "kite": ["mortar"]},
     "upgrade_pref": ["plating", "armor", "nanites", "gyros", "gun_rate", "gun_damage", "lightning_efficiency",
                      "laser_damage", "laser_charge", "mortar_reload", "lightning_range", "lightning_chain",
                      "sensors", "servos", "gun_velocity", "gun_mag", "reactor", "capacitor", "jets",
@@ -53,6 +62,12 @@ PARAMS = {
     # roof
     "roof_min_h": 6.0, "roof_max_h": 42.0, "roof_min_area": 150.0, "roof_max_dist": 280.0, "roof_inset": 8.0,
     "roof_energy_per_m": 1.8, "roof_max_tries": 3,
+    # kite
+    "kite_engage": 100.0, "kite_close": 55.0, "kite_back": 45.0, "kite_push": 8.0, "kite_side": 22.0,
+    "kite_hurt": 0.75, "kite_lightning_dist": 35.0, "kite_hold_hp": 0.62, "kite_hold_clear": 42.0,
+    "kite_hold_quiet_s": 2.0, "kite_disengage_hp": 0.72, "kite_crate_clear": 80.0, "kite_crate_walk_clear": 115.0,
+    "kite_crate_range": 110.0, "kite_crate_walk": 75.0, "dodge_window_s": 0.6, "dodge_weight": 7.0,
+    "dodge_max_proj": 24,
     # timing
     "bfs_budget_s": 0.010,
 }
@@ -156,6 +171,8 @@ class Bot:
         self.handlers = {s: getattr(self, "do_" + s.lower()) for s in self.profile["states"]}
         self.wants = {s: getattr(self, "want_" + s.lower()) for s in self.profile["states"]}
         self.timings = []
+        self.holding = False
+        self.side = 1 if self.slot % 2 == 0 else -1
         gc.collect()
         gc.freeze()
         log(f"[cbot] strategy={self.strategy} map={self.world.nw}x{self.world.nh} roofs={len(self.world.roofs())} "
@@ -500,7 +517,7 @@ class Bot:
 
     def wanted_weapon(self, kind, c):
         skip = PARAMS["weapon_skip"].get(self.strategy, ())
-        pref = PARAMS["weapon_pref"]
+        pref = self.profile.get("weapon_pref", PARAMS["weapon_pref"])
         if kind not in pref or kind in skip:
             return False
         held = [w["kind"] for w in c.me["weapons"] if w]
@@ -551,6 +568,36 @@ class Bot:
         return self.roof is not None and self.on_roof(c)
 
     def want_hold(self, c):
+        return True
+
+    # ---- kite ----
+    def kite_target(self, c):
+        att = self.attacker(c)
+        if att and att[1].get("kind") == "mech" and att[0] < PARAMS["fire_range"]:
+            return att
+        if c.enemies and c.enemies[0][0] < PARAMS["kite_engage"]:
+            return c.enemies[0]
+        return None
+
+    def want_kite(self, c):
+        return self.kite_target(c) is not None
+
+    def crate_goal(self, c):
+        P = PARAMS
+        if c.enemies and c.enemies[0][0] < P["kite_crate_walk_clear"]:
+            return None
+        best, bd = None, 1e18
+        for cr in c.obs.get("crates", []):
+            x, y, z = cr["pos"]
+            d = math.hypot(x - c.x, y - c.y)
+            if d < P["kite_crate_walk"] and abs(z - c.z) < 5 and c.dist_region(x, y) <= 0 and d < bd:
+                best, bd = (x, y), d
+        return best
+
+    def want_crate(self, c):
+        return self.crate_goal(c) is not None
+
+    def want_center(self, c):
         return True
 
     # ================= state behaviors: return (move, boost, jump, look_yaw) =================
@@ -617,6 +664,103 @@ class Bot:
         gx, gy = px + radial * bx, py + radial * by
         mv = self.best_heading(c, lambda dx, dy: dx * gx + dy * gy - self.region_penalty(c, dx, dy), length=8.0)
         return mv, False, False, math.atan2(by, bx)
+
+    def kite_heading(self, c, gx, gy, hurt):
+        """Heading score: progress toward the goal, zone edge, enemy repulsion, bullet near-misses."""
+        P = PARAMS
+        w = self.world
+        speed = c.stats.get("walk_speed", 11.7)
+        radius = c.stats.get("radius", 2.5)
+        height = c.stats.get("height", 9.0)
+        ux, uy = unit(gx - c.x, gy - c.y)
+        dgoal = math.hypot(gx - c.x, gy - c.y)
+        reach = min(1.0, dgoal / 7.0)
+        rep_r, rep_k = (90.0, 0.55) if hurt else (40.0, 0.3)
+        enemies = [m["pos"] for _d, m in c.enemies[:6]]
+        projs = []
+        for p in c.obs.get("projectiles", []):
+            if p.get("kind") == "mortar":
+                continue
+            pp, pv = p["pos"], p["vel"]
+            if abs(pp[0] - c.x) > 200 or abs(pp[1] - c.y) > 200:
+                continue
+            projs.append((pp, pv))
+            if len(projs) >= P["dodge_max_proj"]:
+                break
+        zc, zr = c.zone["center"], c.zone["radius"]
+        best, bs = (0.0, 0.0), -1e18
+        win = P["dodge_window_s"]
+        for k in range(16):
+            a = 2 * math.pi * k / 16
+            dx, dy = math.cos(a), math.sin(a)
+            if not w.clear_ray(c.x, c.y, dx, dy, 8.0):
+                continue
+            qx, qy = c.x + dx * 7, c.y + dy * 7
+            s = 21.0 * reach * (dx * ux + dy * uy)
+            s -= 12.0 * max(0.0, math.hypot(qx - zc[0], qy - zc[1]) - zr + 8.0)
+            s -= 20.0 * self.region_penalty(c, dx, dy)
+            for ex, ey, _ez in enemies:
+                s -= max(0.0, rep_r - math.hypot(qx - ex, qy - ey)) * rep_k
+            vx, vy = dx * speed, dy * speed
+            for pp, pv in projs:
+                rx, ry = pp[0] - c.x, pp[1] - c.y
+                wx, wy = pv[0] - vx, pv[1] - vy
+                den = wx * wx + wy * wy
+                tau = max(0.0, min(win, -(rx * wx + ry * wy) / den)) if den > 1e-9 else 0.0
+                miss = math.hypot(rx + wx * tau, ry + wy * tau)
+                if abs(pp[2] + pv[2] * tau - (c.z + height * 0.5)) < height * 0.7:
+                    s -= max(0.0, radius + 4.0 - miss) * P["dodge_weight"]
+            if s > bs:
+                best, bs = (dx, dy), s
+        return best
+
+    def do_kite(self, c):
+        P = PARAMS
+        d, m = self.kite_target(c)
+        ex, ey = m["pos"][0], m["pos"][1]
+        ax, ay = unit(c.x - ex, c.y - ey)
+        if ax == 0 and ay == 0:
+            ax, ay = 1.0, 0.0
+        hurt = c.hp_frac < P["kite_hurt"]
+        lightning = next((wp for wp in c.me["weapons"] if wp and wp["kind"] == "lightning"), None)
+        laser = any(wp and wp["kind"] == "laser" for wp in c.me["weapons"])
+        if lightning and not laser and not hurt and c.me["energy"] > 20:
+            want = P["kite_lightning_dist"]
+        elif hurt or d < P["kite_close"]:
+            want = P["kite_back"]
+        else:
+            want = P["kite_push"]
+        side = P["kite_side"] * self.side
+        gx, gy = ex + ax * want - ay * side, ey + ay * want + ax * side
+        cx, cy, r = c.region
+        dg = math.hypot(gx - cx, gy - cy)
+        if dg > r and dg > 0:
+            gx, gy = cx + (gx - cx) * r / dg, cy + (gy - cy) * r / dg
+        mv = self.kite_heading(c, gx, gy, c.hp_frac < 0.65)
+        disengage = c.hp_frac < P["kite_disengage_hp"] and d < P["kite_engage"] and c.me["energy"] > 30
+        closing = want == P["kite_lightning_dist"] and d > want + 15 and c.me["energy"] > 60
+        boost = disengage or closing or not c.in_zone
+        return mv, boost, False, math.atan2(ey - c.y, ex - c.x)
+
+    def do_crate(self, c):
+        x, y = self.crate_goal(c)
+        d = math.hypot(x - c.x, y - c.y)
+        mv = (0.0, 0.0) if d < 25 else self.go(c, x, y, 20.0)
+        return mv, False, False, math.atan2(y - c.y, x - c.x)
+
+    def do_center(self, c):
+        cx, cy, r = c.region
+        d = math.hypot(cx - c.x, cy - c.y)
+        if d < max(6.0, min(20.0, r * 0.3)):
+            mv = (0.0, 0.0)
+        else:
+            mv = self.go(c, cx, cy, 5.0)
+        heading = math.atan2(mv[1], mv[0]) if mv != (0.0, 0.0) else self.watch_yaw(c, math.atan2(cy - c.y, cx - c.x) if d > 1 else 0.0)
+        if c.enemies:
+            m = c.enemies[0][1]
+            heading = math.atan2(m["pos"][1] - c.y, m["pos"][0] - c.x)
+        boost = self.zone_urgent(c) or (c.me["energy"] > 70 and d > 80)
+        return mv, boost, False, self.threat_look(c, heading)
 
     def do_rotate(self, c):
         self.ensure_spot(c)
@@ -710,8 +854,41 @@ class Bot:
         return mv, False, False, self.threat_look(c, self.watch_yaw(c, math.atan2(c.y - cy, c.x - cx)))
 
     # ================= gunnery =================
+    def kite_hold(self, c):
+        P = PARAMS
+        nd = c.enemies[0][0] if c.enemies else 1e9
+        hold = c.hp_frac < P["kite_hold_hp"] and nd > P["kite_hold_clear"] and c.t - self.last_damage_t > P["kite_hold_quiet_s"]
+        if hold != self.holding:
+            log(f"[cbot] t={c.t:.1f} holdfire {'on' if hold else 'off'} hp={c.hp_frac:.2f} nd={nd:.0f}")
+            self.holding = hold
+        return hold
+
+    def pick_target_kite(self, c):
+        P = PARAMS
+        if self.kite_hold(c):
+            return None
+        cands = []
+        for d, m in c.enemies + c.npcs:
+            if d < P["fire_range"]:
+                cands.append((d + 0.025 * m.get("hp", 1000) + (30 if m.get("kind") != "mech" else 0), d, m))
+        if not c.enemies or c.enemies[0][0] > P["kite_crate_clear"]:
+            for cr in c.obs.get("crates", []):
+                d = math.hypot(cr["pos"][0] - c.x, cr["pos"][1] - c.y)
+                if d < P["kite_crate_range"]:
+                    cands.append((d - 10, d, {"id": cr["id"], "kind": "crate", "pos": cr["pos"], "vel": [0.0, 0.0, 0.0],
+                                              "hp": cr.get("hp", 300)}))
+        cands.sort(key=lambda e: e[0])
+        for _s, d, m in cands[:P["max_los_checks"]]:
+            k = m.get("kind")
+            center = (m["pos"][0], m["pos"][1], m["pos"][2] + (4.5 if k == "mech" else 1.75 if k == "npc" else 2.0))
+            if self.world.los(c.muzzle, center):
+                return d, m, center
+        return None
+
     def pick_target(self, c):
         P = PARAMS
+        if self.strategy == "kite":
+            return self.pick_target_kite(c)
         policy = self.profile["fire"]
         attacked = self.threat_recent(c, P["threat_memory_s"])
         if policy == "attacked" and not attacked:
@@ -839,7 +1016,7 @@ class Bot:
         offer = c.obs.get("offer")
         if offer and offer.get("choices"):
             ids = [ch["id"] for ch in offer["choices"]]
-            pref = P["upgrade_pref"]
+            pref = self.profile.get("upgrade_pref", P["upgrade_pref"])
             act["pick"] = min(range(len(ids)), key=lambda i: pref.index(ids[i]) if ids[i] in pref else 99)
         reach = self.cfg["loot"].get("pickup_radius", 4.0)
         weapons = c.me["weapons"]
@@ -862,7 +1039,7 @@ class Bot:
                     break
         gun = weapons[0] if weapons and weapons[0] and weapons[0]["kind"] == "gun" else None
         if gun and not act["fire"][0] and gun.get("reload", 0) <= 0 \
-                and gun.get("ammo", 99) < gun["stats"].get("mag", 12) * 0.5 and not c.enemies:
+                and gun.get("ammo", 99) < gun["stats"].get("mag", 12) * 0.5 and (not c.enemies or self.holding):
             act["reload"] = True
 
 
