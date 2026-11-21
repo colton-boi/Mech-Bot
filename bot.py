@@ -38,11 +38,13 @@ PARAMS = {
     "max_los_checks": 5,
     # loot and drops
     "loot_detour": 35.0, "cube_detour": 30.0, "weapon_detour_empty": 80.0, "fight_loot_r": 18.0,
-    "fight_weapon_r": 40.0, "fight_weapon_min_target": 60.0, "fight_loot_give_up_s": 2.5, "quiet_s": 12.0, "loot_enemy_clear": 80.0,
+    "fight_weapon_frac": 0.6, "fight_weapon_cap": 80.0, "fight_weapon_blind": 40.0, "fight_loot_give_up_s": 2.5, "quiet_s": 12.0, "loot_enemy_clear": 80.0,
+    "crate_r": 30.0, "crate_min_target": 90.0, "crate_min_hp": 0.6,
     "drop_max_dist": 170.0, "drop_enemy_clear": 60.0,
     "farm_range": 75.0, "farm_min_hp": 0.75, "farm_until_t": 200.0,
     "weapon_pref": ["lightning", "laser", "mortar"],
-    "upgrade_pref": ["gun_mag", "plating", "armor", "gun_damage", "gun_rate", "lightning_efficiency",
+    "lt_stop_energy": 8.0, "lt_resume_energy": 32.0, "lt_boost_energy": 45.0, "lt_boost_dist": 70.0,
+    "upgrade_pref": ["gun_mag", "lightning_efficiency", "plating", "armor", "gun_damage", "gun_rate",
                      "laser_damage", "laser_charge", "nanites", "gyros", "lightning_range", "lightning_chain",
                      "mortar_reload", "sensors", "servos", "gun_velocity", "reactor", "capacitor", "jets",
                      "mortar_splash", "mortar_velocity", "laser_pierce"],
@@ -159,6 +161,8 @@ class Bot:
         self.lock_pick = None
         self.fight_loot = None      # (item id, start t, give-up s)
         self.loot_skip = {}         # item id -> t until which it is ignored
+        self.lt_dry = False         # lightning paused until energy is back to lt_resume_energy
+        self.crate_id = None
         self.handlers = {s: getattr(self, "do_" + s.lower()) for s in self.profile["states"]}
         self.wants = {s: getattr(self, "want_" + s.lower()) for s in self.profile["states"]}
         self.timings = []
@@ -567,6 +571,10 @@ class Bot:
                 best, bd = cu["pos"], d
         return best
 
+    def toward_region(self, c, x, y):
+        """Inside the next circle, or no farther from it than we already are (early, before the first shrink)."""
+        return c.dist_region(x, y) <= max(0.0, c.dist_region()) + 5.0
+
     def slot1_empty(self, c):
         w = c.me["weapons"]
         return len(w) < 2 or w[1] is None
@@ -578,11 +586,12 @@ class Bot:
 
         def ok(it):
             x, y, z = it["pos"]
-            return abs(z - c.z) < 4 and self.loot_skip.get(it["id"], -1.0) < c.t and c.dist_region(x, y) <= 0
+            return abs(z - c.z) < 4 and self.loot_skip.get(it["id"], -1.0) < c.t and self.toward_region(c, x, y)
 
+        cube_r = P["cube_detour"] if d_tgt > P["crate_min_target"] else P["fight_loot_r"]
         for cu in c.obs.get("cubes", []):
             d = math.hypot(cu["pos"][0] - c.x, cu["pos"][1] - c.y)
-            if d < P["fight_loot_r"] and d < bd and ok(cu):
+            if d < cube_r and d < bd and ok(cu):
                 best, bd = cu, d
         empty = self.slot1_empty(c)
         for p in c.obs.get("pickups", []):
@@ -590,9 +599,11 @@ class Bot:
                 continue
             d = math.hypot(p["pos"][0] - c.x, p["pos"][1] - c.y)
             r = P["fight_loot_r"]
-            if empty and d_tgt > P["fight_weapon_min_target"]:
-                r = P["fight_weapon_r"]
-            if d < r and d < bd and ok(p):
+            if empty:
+                # the first real weapon is worth more than closing on a far target: reach scales with its distance
+                r = max(r, min(P["fight_weapon_cap"], P["fight_weapon_frac"] * d_tgt))
+            if d < r and d < bd and ok(p) and (d <= P["fight_weapon_blind"] or self.world.clear_ray(
+                    c.x, c.y, (p["pos"][0] - c.x) / d, (p["pos"][1] - c.y) / d, d)):
                 best, bd = p, d
         return best, bd
 
@@ -697,10 +708,10 @@ class Bot:
                 lx, ly = unit(x - c.x, y - c.y)
                 # local heading only: a flow field per item would churn the shared path search mid-fight
                 mv = (lx, ly) if ld < 5 else self.best_heading(c, lambda dx, dy: dx * lx + dy * ly, length=min(10.0, ld))
-                return mv, ld > 6 and c.me["energy"] > P["aggro_boost_energy"], False, math.atan2(by, bx)
+                return mv, ld > 6 and c.me["energy"] > self.boost_floor(c, d), False, math.atan2(by, bx)
             self.fight_loot = None
         if self.strategy == "aggro" and d > hi:
-            boost = c.me["energy"] > P["aggro_boost_energy"]
+            boost = c.me["energy"] > self.boost_floor(c, d)
             if d < P["aggro_direct_dist"] and c.z - c.ground < 3.0 and self.world.clear_ray(c.x, c.y, bx, by, d - hi * 0.5):
                 mv = self.best_heading(c, lambda dx, dy: dx * bx + dy * by - self.region_penalty(c, dx, dy), length=8.0)
             else:
@@ -709,6 +720,13 @@ class Bot:
         gx, gy = px + radial * bx, py + radial * by
         mv = self.best_heading(c, lambda dx, dy: dx * gx + dy * gy - self.region_penalty(c, dx, dy), length=8.0)
         return mv, False, False, math.atan2(by, bx)
+
+    def boost_floor(self, c, d):
+        """Energy kept for lightning once the target is near: boosting would empty the arc's magazine."""
+        P = PARAMS
+        if d < P["lt_boost_dist"] and any(w and w["kind"] == "lightning" for w in c.me["weapons"]):
+            return P["lt_boost_energy"]
+        return P["aggro_boost_energy"]
 
     def do_rotate(self, c):
         self.ensure_spot(c)
@@ -891,8 +909,13 @@ class Bot:
             if lt is not None:
                 ls = weapons[lt]["stats"]
                 direct = math.atan2(py - my, px - mx)
+                e = c.me["energy"]
+                if e <= P["lt_stop_energy"]:
+                    self.lt_dry = True
+                elif e >= P["lt_resume_energy"]:
+                    self.lt_dry = False
                 if d < ls.get("range", 45) * 0.95 and abs(wrap(c.me["aim"][0] - direct)) < math.radians(ls.get("cone_deg", 30)) * 0.4 \
-                        and c.me["energy"] > 10:
+                        and not self.lt_dry and e > ls.get("energy", 3):
                     fire[lt] = True
             if laser_slot is not None:
                 lw = weapons[laser_slot]
@@ -906,10 +929,58 @@ class Bot:
                         fire[gun] = fire[gun] and self.aimed(c, direct_yaw, direct_pitch, tol)
         elif laser_slot is not None and weapons[laser_slot].get("charge", 0) > 0:
             fire[laser_slot] = False
+        else:
+            cr = self.crate_target(c)
+            if cr is not None:
+                aim_yaw, aim_pitch, fire = self.shoot_crate(c, cr, weapons)
         mp = c.stats.get("max_pitch", 1.3)
         np_ = c.stats.get("min_pitch", -0.7)
         aim_pitch = min(mp, max(np_, finite(aim_pitch)))
         return [round(wrap(finite(aim_yaw)), 4), round(aim_pitch, 4)], fire
+
+    def crate_target(self, c):
+        """A crate worth a few shots: nothing else to shoot, near, on our level, healthy enough. One LOS check."""
+        P = PARAMS
+        if self.strategy != "aggro" or c.hp_frac < P["crate_min_hp"] or self.state in ("ESCAPE", "DODGE") \
+                or self.zone_urgent(c):
+            return None
+        if any(d < P["crate_min_target"] for d, _m in c.enemies):
+            return None
+        best, bd = None, P["crate_r"]
+        for cr in c.obs.get("crates", []):
+            x, y, z = cr["pos"]
+            d = math.hypot(x - c.x, y - c.y)
+            if d < bd and abs(z - c.z) < 4 and self.toward_region(c, x, y):
+                best, bd = cr, d
+        if best is None:
+            return None
+        x, y, z = best["pos"]
+        if not self.world.los(c.muzzle, (x, y, z + 1.2)):
+            return None
+        if self.crate_id != best["id"]:
+            self.crate_id = best["id"]
+            log(f"[cbot] t={c.t:.1f} crate {best['id']} {bd:.0f} m hp={best.get('hp')}")
+        return best
+
+    def shoot_crate(self, c, cr, weapons):
+        mx, my, mz = c.muzzle
+        x, y, z = cr["pos"]
+        z += 1.2
+        yaw = math.atan2(y - my, x - mx)
+        d = math.hypot(x - mx, y - my)
+        pitch = math.atan2(z - mz, d)
+        fire = [False, False]
+        on = self.aimed(c, yaw, pitch, max(PARAMS["aim_tol_min"], math.atan2(1.0, max(d, 1.0))))
+        for i, w in enumerate(weapons):
+            if not w or not on:
+                continue
+            k = w["kind"]
+            if k == "gun" and w.get("ammo", 1) > 0 and w.get("reload", 0) <= 0:
+                fire[i] = True
+            elif k == "lightning" and d < w["stats"].get("range", 45) * 0.9 and not self.lt_dry \
+                    and c.me["energy"] > PARAMS["lt_resume_energy"]:
+                fire[i] = True
+        return yaw, pitch, fire
 
     def aimed(self, c, yaw, pitch, tol):
         ay, ap = c.me["aim"]
@@ -963,7 +1034,8 @@ class Bot:
                 break
         gun = weapons[0] if weapons and weapons[0] and weapons[0]["kind"] == "gun" else None
         if gun and not act["fire"][0] and gun.get("reload", 0) <= 0 \
-                and gun.get("ammo", 99) < gun["stats"].get("mag", 12) * 0.5 and not c.enemies:
+                and gun.get("ammo", 99) < gun["stats"].get("mag", 12) * 0.5 \
+                and not any(d < P["crate_min_target"] for d, _m in c.enemies):
             act["reload"] = True
 
 
