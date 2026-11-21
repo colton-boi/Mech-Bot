@@ -34,7 +34,7 @@ PARAMS = {
                                    "jets", "laser_pierce"]},
     },
     # squad: engagement triggers
-    "sq_cap": 240.0, "sq_gun_r": 80.0, "sq_near": 60.0, "sq_hit_s": 6.0, "sq_close_v": 3.0, "sq_close_d": 180.0,
+    "sq_cap": 240.0, "sq_near": 60.0, "sq_hit_s": 6.0, "sq_close_v": 3.0, "sq_close_d": 180.0,
     "sq_weak_frac": 0.40, "sq_weak_d": 160.0, "sq_aim_rad": 0.22, "sq_aim_d": 190.0, "sq_stick_s": 2.0,
     # squad: target score
     "sq_hp_w": 0.2, "sq_low_frac": 0.30, "sq_low_bonus": 100.0, "sq_stick_bonus": 120.0, "sq_hit_bonus": 40.0,
@@ -1129,7 +1129,8 @@ class Bot:
 
     def sq_fight_loot(self, c, d_tgt):
         P = PARAMS
-        best, bd = None, P["sq_cube_r_hurt"] if c.hp_frac <= P["sq_cube_hurt_hp"] else P["sq_cube_r"]
+        # close3's rule (paid in real practice): cubes at our feet, wider only when the target is far
+        best, bd = None, P["cube_detour"] if d_tgt > P["crate_min_target"] else P["fight_loot_r"]
         for cu in c.obs.get("cubes", []):
             d = math.hypot(cu["pos"][0] - c.x, cu["pos"][1] - c.y)
             if d < bd and abs(cu["pos"][2] - c.z) < 4 and self.sq_item_ok(c, cu["id"], cu["pos"]):
@@ -1458,9 +1459,7 @@ class Bot:
             on = self.aimed(c, aim_yaw, aim_pitch, tol)
             if gun is not None:
                 gw = weapons[gun]
-                # squad: no long gun shots at mechs; they wake up bystanders and cost real practice
-                gun_ok = self.strategy != "squad" or m.get("kind") != "mech" or d <= P["sq_gun_r"]
-                if gun_ok and on and gw.get("ammo", 1) > 0 and gw.get("reload", 0) <= 0 and d < gw["stats"].get("range", 230):
+                if on and gw.get("ammo", 1) > 0 and gw.get("reload", 0) <= 0 and d < gw["stats"].get("range", 230):
                     fire[gun] = True
             lt = kinds.get("lightning")
             if lt is not None:
