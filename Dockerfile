@@ -1,6 +1,14 @@
-# Build from this folder: docker build -t my-bot .
-# The match runs it with no network, a read-only root (writable /tmp), 1 CPU, 512 MB, and the map at /arena.
-FROM python:3.13-slim
-WORKDIR /bot
-COPY . .
-ENTRYPOINT ["python3", "-u", "/bot/bot.py"]
+# The submitted bot. Build from this folder: docker build -t mech-rs .
+# A match runs it as uid 65534 with no network, a read-only root, 1 CPU, 512 MB,
+# and the map at /arena. The binary is static, so the runtime image is empty.
+FROM rust:1.100.0-alpine3.22 AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release --locked -p bot
+
+FROM scratch
+COPY --from=build /src/target/release/bot /bot
+COPY params.json /params.json
+ENV MECH_PARAMS=/params.json MECH_POLICY=aggro
+ENTRYPOINT ["/bot"]

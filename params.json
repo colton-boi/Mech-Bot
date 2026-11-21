@@ -1,0 +1,15 @@
+{
+ "spot_w_conceal": 20,
+ "fire_tol_radius_frac": 0.6,
+ "exposed_break_n": 2,
+ "silent_speed_frac": 0.9,
+ "recover_on": 1,
+ "recover_los_break": 1,
+ "slew_gate": 1,
+ "centre_brake": 1,
+ "target_score_on": 1,
+ "ffa_final_on": 1,
+ "ffa_early_on": 1,
+ "no_mortar": 1,
+ "mode_gate_t": 15.0
+}
