@@ -58,6 +58,7 @@ PARAMS = {
     "roof_energy_per_m": 1.8, "roof_max_tries": 3,
     # timing
     "bfs_budget_s": 0.010,
+    "rest_after_s": 0.5,
 }
 
 STRATEGY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy.txt")
@@ -87,267 +88,6 @@ def unit(dx, dy):
 
 def finite(v, default=0.0):
     return v if isinstance(v, (int, float)) and math.isfinite(v) else default
-
-
-STATS_UNTIL_T = 60.0           # print the match stats to stderr and stop at this match time
-END_FAIL_AFTER_T = 45.0        # on `end`, exit with status 1 only if the last observation was later than this
-WEAPON_CH = {"gun": "g", "laser": "L", "lightning": "Z", "mortar": "M", "npc": "n", "zone": "z"}
-SLOT_CYCLE = "ECSAR"           # assumed fill order of the built-in bots' styles
-FAMILY = {"E": "E", "C": "C", "R": "C", "S": "S", "A": "S"}
-
-
-def _near_mech(p, m, r=4.0):
-    """Point p is inside (a slightly padded) mech cylinder m."""
-    q = m["pos"]
-    return math.hypot(p[0] - q[0], p[1] - q[1]) < r and q[2] - 1.0 < p[2] < q[2] + 10.0
-
-
-def _seg_dist(a, v, dt, c):
-    """Distance from point c to the segment a -> a + v*dt."""
-    d = [v[i] * dt for i in range(3)]
-    dd = sum(x * x for x in d) or 1e-9
-    s = max(0.0, min(1.0, sum((c[i] - a[i]) * d[i] for i in range(3)) / dd))
-    return math.dist(c, [a[i] + d[i] * s for i in range(3)])
-
-
-class MatchLog:
-    """Records what this mech observes (other mechs, beams, bullets, deaths) and prints a short
-    summary to stderr. Cheap per tick: a few loops over the visible mechs and projectiles."""
-
-    def __init__(self):
-        self.done = False
-        self.slot, self.seed, self.walk = 0, 0, 11.7
-        self.t, self.hp, self.alive = 0.0, 0, None
-        self.alive_hist = []      # (t, alive, our kill)
-        self.mechs = {}           # id -> record
-        self.prev = {}            # id -> mech dict from the previous obs
-        self.proj = {}            # projectile id -> [shooter or None, pos, vel, kind]
-        self.pending = []         # (shooter, victim, weapon char, t) geometric hits awaiting an HP drop
-        self.hits = {}            # (shooter, victim, weapon char) -> [confirmed, total]
-        self.hp_drop = {}         # id -> t of its last visible HP drop
-        self.last_src = {}        # id -> (source, weapon char, t)
-        self.deaths = []          # (id or None, t, source text)
-        self.errors, self.first_error = 0, ""
-
-    def start(self, hello):
-        self.slot, self.seed = hello.get("slot", 0), hello.get("seed", 0)
-        self.walk = hello.get("config", {}).get("mech", {}).get("walk_speed", 11.7)
-
-    def rec(self, i, t):
-        r = self.mechs.get(i)
-        if r is None:
-            r = self.mechs[i] = {"first": t, "last": t, "w": None, "wh": [], "hp": 0, "hpmin": 1e9, "vmax": 0.0,
-                                 "vsum": 0.0, "n": 0, "boost": 0, "air": 0, "fire": None, "us": None, "take": None}
-        return r
-
-    def fired(self, i, t):
-        r = self.rec(i, t)
-        if r["fire"] is None:
-            r["fire"] = t
-
-    def add_hit(self, s, v, w, t):
-        self.pending.append((s, v, w, t))
-        self.last_src[v] = (str(s), w, t)
-
-    def observe(self, obs):
-        t = obs.get("t", 0.0)
-        self.t, self.hp = t, round(obs.get("self", {}).get("hp", 0))
-        cur = {m["id"]: m for m in obs.get("mechs", []) if m.get("kind") == "mech"}
-        kills = []
-        for e in obs.get("events", []):
-            et = e.get("type")
-            if et == "damaged" and isinstance(e.get("by"), int) and e["by"] < 100:
-                r = self.rec(e["by"], t)
-                self.fired(e["by"], t)
-                w = WEAPON_CH.get(e.get("weapon"), "?")
-                if r["us"] is None:
-                    r["us"] = [t, w, 0]
-                r["us"][2] += e.get("amount", 0)
-            elif et == "hit" and isinstance(e.get("target"), int) and e["target"] < 100:
-                self.last_src[e["target"]] = ("me", WEAPON_CH.get(e.get("weapon"), "?"), t)
-            elif et == "kill":
-                kills.append(e.get("target"))
-        for i, m in cur.items():
-            r = self.rec(i, t)
-            r["last"] = t
-            hp = m.get("hp")
-            if hp is not None:
-                p = self.prev.get(i)
-                if p is not None and p.get("hp") is not None and hp < p["hp"] - 1:
-                    self.hp_drop[i] = t
-                r["hp"], r["hpmin"] = round(hp), min(r["hpmin"], round(hp))
-            v = m.get("vel", (0, 0, 0))
-            sp = math.hypot(v[0], v[1])
-            r["vmax"] = max(r["vmax"], sp)
-            r["vsum"] += sp
-            r["n"] += 1
-            r["boost"] += sp > self.walk * 1.2
-            r["air"] += abs(v[2]) > 1.5
-            ws = "".join(sorted(WEAPON_CH.get(k, "?").upper() for k in m.get("weapons", [])))
-            if m.get("charging") and "L" not in ws:
-                ws += "L"
-            if ws != r["w"]:
-                if r["w"] is not None and r["take"] is None and len(ws) > len(r["w"]):
-                    r["take"] = t
-                r["w"] = ws
-                r["wh"].append((t, ws))
-        for b in obs.get("beams", []):
-            s = b.get("by")
-            if s is None:
-                continue
-            self.fired(s, t)
-            w = WEAPON_CH.get(b.get("kind"), "?")
-            path = b.get("path") or []
-            for a, z in zip(path, path[1:]):
-                d = [z[k] - a[k] for k in range(3)]
-                for i, m in cur.items():
-                    q = m["pos"]
-                    if i != s and (_near_mech(z, m) or _seg_dist(a, d, 1.0, (q[0], q[1], q[2] + 4.5)) < 4.0):
-                        self.add_hit(s, i, w, t)
-        seen = set()
-        for p in obs.get("projectiles", []):
-            pid = p.get("id")
-            seen.add(pid)
-            tr = self.proj.get(pid)
-            if tr is not None:
-                tr[1], tr[2] = p["pos"], p["vel"]
-                continue
-            shooter, best = None, 45.0
-            if p.get("kind") != "npc":
-                pv = p["vel"]
-                nv = math.sqrt(sum(x * x for x in pv)) or 1e-9
-                for i, m in cur.items():
-                    q = m["pos"]
-                    d = [p["pos"][0] - q[0], p["pos"][1] - q[1], p["pos"][2] - q[2] - 7.0]
-                    nd = math.sqrt(sum(x * x for x in d))
-                    if 1.0 < nd < best and sum(d[k] * pv[k] for k in range(3)) / (nd * nv) > 0.99:
-                        shooter, best = i, nd
-            if shooter is not None:
-                self.fired(shooter, t)
-            self.proj[pid] = [shooter, p["pos"], p["vel"], WEAPON_CH.get(p.get("kind"), "?")]
-        for pid in [k for k in self.proj if k not in seen]:
-            s, pos, vel, w = self.proj.pop(pid)
-            if s is None:
-                continue
-            for i, m in self.prev.items():
-                if i != s:
-                    q = m["pos"]
-                    if _seg_dist(pos, vel, 0.15, (q[0], q[1], q[2] + 4.5)) < 4.5:
-                        self.add_hit(s, i, w, t)
-                        break
-        keep = []
-        for s, v, w, pt in self.pending:
-            h = self.hits.setdefault((s, v, w), [0, 0])
-            if self.hp_drop.get(v, -1.0) >= pt - 0.01:
-                h[0] += 1
-                h[1] += 1
-            elif t - pt > 0.25:
-                h[1] += 1
-            else:
-                keep.append((s, v, w, pt))
-        self.pending = keep
-        alive = obs.get("alive")
-        if alive is not None:
-            if self.alive is not None and alive < self.alive:
-                n = self.alive - alive
-                dead = [k for k in kills if isinstance(k, int)]
-                gone = sorted((i for i in self.prev if i not in cur and i not in dead),
-                              key=lambda i: self.prev[i].get("hp") or 0)
-                dead += gone[:max(0, n - len(dead))]
-                for i in dead[:n]:
-                    src = "me" if i in kills else "%s%s" % self.last_src.get(i, ("?", ""))[:2]
-                    self.deaths.append((i, t, src))
-                for _ in range(n - len(dead[:n])):
-                    self.deaths.append((None, t, "?"))
-                self.alive_hist.append((t, alive, bool(kills)))
-            elif self.alive is None:
-                self.alive_hist.append((t, alive, False))
-            self.alive = alive
-        self.prev = cur
-
-    def guess(self, r):
-        held = set("".join(w for _t, w in r["wh"]))
-        air = r["air"] / max(1, r["n"])
-        vmean = r["vsum"] / max(1, r["n"])
-        f, take = r["fire"], r["take"]
-        if f is not None and r["first"] <= 3.0 and f < 2.0:
-            return "S"
-        if f is not None and r["first"] <= 5.0 and f < 5.0:
-            return "A"
-        if held & {"Z", "M"} and take is not None and take < 7.0:
-            return "E"
-        if (take is not None and take >= 9.0) or (held <= {"G"} and r["last"] >= 12.0):
-            if "Z" in held:
-                return "C"
-            if held & {"L", "M"}:
-                return "R"
-            return "C" if vmean < 9.0 else "R"
-        if "L" in held and (air > 0.35 or r["boost"] / max(1, r["n"]) > 0.25):
-            return "A"
-        if held & {"Z", "M"}:
-            return "E"
-        return "?"
-
-    def cycle_fit(self, g):
-        known = {i: c for i, c in g.items() if c != "?" and i != self.slot}
-        if not known:
-            return "cyc n/a"
-        out = []
-        for name, idx in (("slot", lambda i: i), ("skip", lambda i: i if i < self.slot else i - 1)):
-            best = None
-            for k in range(5):
-                ex = sum(SLOT_CYCLE[(idx(i) + k) % 5] == c for i, c in known.items())
-                fam = sum(FAMILY[SLOT_CYCLE[(idx(i) + k) % 5]] == FAMILY[c] for i, c in known.items())
-                if best is None or (ex, fam) > best[:2]:
-                    best = (ex, fam, k)
-            pred = "".join(SLOT_CYCLE[(idx(i) + best[2]) % 5] if i != self.slot else "*" for i in range(16))
-            out.append(f"{name} {best[0]}/{len(known)} fam{best[1]} {pred}")
-        return "cyc " + " | ".join(out)
-
-    def summary(self, reason):
-        err = f" err{self.errors} {self.first_error}" if self.errors else ""
-        lines = [f"ML s{self.slot} seed{self.seed} t{self.t:.1f} hp{self.hp} {reason}{err}"]
-        g = {}
-        toks = []
-        for i in sorted(self.mechs):
-            r = self.mechs[i]
-            g[i] = self.guess(r)
-            wh = ">".join(f"{w}{tt:.0f}" for tt, w in r["wh"]) or "-"
-            n = max(1, r["n"])
-            hp = f"{r['hp']}/{r['hpmin']}" if r["n"] else "-"
-            fire = f" F{r['fire']:.1f}" if r["fire"] is not None else ""
-            toks.append(f"{i}{g[i]} s{r['first']:.0f} {wh} hp{hp} v{r['vsum'] / n:.0f}/{r['vmax']:.0f}"
-                        f" b{100 * r['boost'] // n} j{100 * r['air'] // n}{fire}")
-        for k in range(0, len(toks), 2):
-            lines.append(" ; ".join(toks[k:k + 2]))
-        hits = " ".join(f"{s}>{v}{w}{c}/{n}" for (s, v, w), (c, n) in sorted(self.hits.items()))
-        lines.append("hitO " + (hits or "-"))
-        us = " ".join(f"{i}@{r['us'][0]:.1f}{r['us'][1]}{round(r['us'][2])}" for i, r in sorted(self.mechs.items()) if r["us"])
-        lines.append("us " + (us or "-"))
-        lines.append("dead " + (" ".join(f"{'?' if i is None else i}@{t:.1f}<{s}" for i, t, s in self.deaths) or "-"))
-        lines.append("alive " + " ".join(f"{a}@{t:.1f}{'k' if k else ''}" for t, a, k in self.alive_hist))
-        lines.append("type " + " ".join(f"{i}:{c}" for i, c in sorted(g.items())))
-        lines.append(self.cycle_fit(g))
-        return "\n".join(ln[:200] for ln in lines) + "\n"
-
-    def finish(self, reason, code=1):
-        """Print the summary once and end the process with the given status."""
-        if self.done:
-            return
-        self.done = True
-        try:
-            text = self.summary(reason)
-        except Exception as ex:
-            text = f"ML summary failed: {ex!r}\n"
-        try:
-            sys.stderr.write(text)
-            sys.stderr.flush()
-            sys.stdout.flush()
-        finally:
-            os._exit(code)  # not sys.exit: the stdin reader thread could block interpreter shutdown
-
-
-MATCH_LOG = MatchLog()
 
 
 class Ctx:
@@ -391,7 +131,6 @@ class Bot:
 
     def __init__(self, hello):
         t0 = time.perf_counter()
-        MATCH_LOG.start(hello)
         self.cfg = hello["config"]
         self.slot = hello.get("slot", 0)
         self.rng = random.Random(hello.get("seed", 0))
@@ -435,14 +174,9 @@ class Bot:
 
     # ================= main =================
     def act(self, obs):
+        if obs["t"] >= PARAMS["rest_after_s"]:
+            return self.rest(obs)
         t0 = time.perf_counter()
-        try:
-            MATCH_LOG.observe(obs)
-        except Exception as ex:
-            MATCH_LOG.errors += 1
-            MATCH_LOG.first_error = MATCH_LOG.first_error or repr(ex)[:60]
-        if obs.get("t", 0.0) >= STATS_UNTIL_T:
-            MATCH_LOG.finish("t>=%g" % STATS_UNTIL_T)
         c = Ctx(self, obs)
         self.remember(c)
         self.reflex_scan(c)
@@ -474,9 +208,10 @@ class Bot:
             log(f"[cbot] act ms p50={ts[len(ts) // 2]:.2f} p99={ts[int(len(ts) * 0.99)]:.2f} max={ts[-1]:.2f}")
         return act
 
-    def on_end(self, msg):
-        MATCH_LOG.finish(f"end place{msg.get('place')} kills{msg.get('kills')}",
-                         1 if MATCH_LOG.t > END_FAIL_AFTER_T else 0)
+    def rest(self, obs):
+        aim = obs["self"].get("aim", [0.0, 0.0])
+        return {"tick": obs["tick"], "move": [0.0, 0.0], "boost": False, "jump": False,
+                "aim": [round(finite(aim[0]), 4), round(finite(aim[1]), 4)], "fire": [False, False]}
 
     # ================= memory =================
     def remember(self, c):
@@ -1314,4 +1049,3 @@ class Bot:
 
 if __name__ == "__main__":
     mf.run(Bot)
-    MATCH_LOG.finish("eof", 1 if MATCH_LOG.t > END_FAIL_AFTER_T else 0)

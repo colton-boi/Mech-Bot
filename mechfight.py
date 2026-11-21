@@ -537,9 +537,6 @@ def run(make_bot: Any) -> None:
             elif kind == "obs":
                 latest = msg
             elif kind == "end":
-                hook = getattr(bot, "on_end", None)
-                if hook is not None:
-                    hook(msg)
                 return
         if latest is None:
             continue
