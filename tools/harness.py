@@ -135,9 +135,72 @@ def walk(strat, decisions=1500):
           f"(radius {zr}) spot {b.spot and tuple(round(v) for v in b.spot[:2])} states {trail}")
 
 
+def recover():
+    """Recover mode: enter when hurt and unpressed, hold fire and stay out of FIGHT/HUNT/FARM while a far mech
+    is visible, leave on a near mech, a hit, or at the exit HP. Other strategies never enter it."""
+    hello, obs = load_stream()
+    pr = botmod.PARAMS["strategies"]["aggro"]
+    base = copy.deepcopy(obs[min(50, len(obs) - 1)])
+    base["projectiles"], base["sounds"], base["events"], base["mechs"] = [], [], [], []
+    base["self"]["in_zone"] = True
+    zc = base["zone"]["next_center"]
+    base["self"]["pos"] = [zc[0], zc[1], base["self"]["pos"][2]]
+    mx = base["self"]["max_hp"]
+    tick = [0]
+
+    def step(b, hp, mechs=(), events=()):
+        o = copy.deepcopy(base)
+        o["tick"], o["t"] = tick[0], 20.0 + tick[0] * 0.1
+        tick[0] += 1
+        o["self"]["hp"] = hp * mx
+        o["mechs"], o["events"] = [enemy(i + 1, o["self"], d, 0.3) for i, d in enumerate(mechs)], list(events)
+        a = b.act(o)
+        valid(a, o["tick"])
+        return a
+
+    hit = {"type": "damaged", "amount": 45, "weapon": "gun", "bearing": 0.3, "by": 1}
+    botmod.read_strategy = lambda: "aggro"
+    b = botmod.Bot(hello)
+    step(b, 0.95)
+    assert not b.recovering
+    step(b, pr["recover_frac"] - 0.1, events=[hit])
+    assert not b.recovering, "a fresh hit keeps us pressed"
+    for _ in range(int(pr["recover_quiet_s"] * 10) + 2):
+        a = step(b, pr["recover_frac"] - 0.1, mechs=[100.0])
+    assert b.recovering, "quiet for recover_quiet_s with only a far mech -> recover"
+    assert not any(a["fire"]) and b.state not in ("FIGHT", "HUNT", "FARM"), (a["fire"], b.state)
+    assert b.spot is not None
+    step(b, pr["recover_frac"] - 0.1, mechs=[pr["recover_clear_dist"] - 5])
+    assert not b.recovering and b.state == "FIGHT", "a near mech ends recover"
+    step(b, pr["recover_frac"] - 0.1)
+    assert b.recovering
+    step(b, pr["recover_exit_frac"] - 0.05)
+    assert b.recovering, "hysteresis: stay in until the exit HP"
+    step(b, pr["recover_exit_frac"])
+    assert not b.recovering, "exit HP ends recover"
+    step(b, pr["recover_frac"] + 0.05)
+    assert not b.recovering, "above recover_frac does not enter"
+    step(b, pr["recover_frac"] - 0.1)
+    assert b.recovering
+    step(b, pr["recover_frac"] - 0.1, events=[hit])
+    assert not b.recovering, "a hit ends recover"
+    for strat in botmod.PARAMS["strategies"]:
+        if "recover_frac" in botmod.PARAMS["strategies"][strat]:
+            continue
+        botmod.read_strategy = lambda s=strat: s
+        b = botmod.Bot(hello)
+        tick[0] = 0
+        for _ in range(80):
+            step(b, 0.3, mechs=[100.0])
+            assert not b.recovering, strat
+    print("recover: ok")
+
+
 if __name__ == "__main__":
     if sys.argv[1:2] == ["walk"]:
         for st in sys.argv[2:] or ["survive", "hide", "aggro"]:
             walk(st)
+    elif sys.argv[1:2] == ["recover"]:
+        recover()
     else:
         main()

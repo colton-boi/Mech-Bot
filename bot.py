@@ -23,7 +23,9 @@ PARAMS = {
         "hide": {"states": ["ESCAPE", "DODGE", "ROTATE", "HOLD"], "fire": "attacked", "spot": "corner"},
         "roof": {"states": ["ESCAPE", "DODGE", "CLIMB", "PERCH", "ROTATE", "HOLD"], "fire": "attacked", "spot": "cover"},
         "aggro": {"states": ["ESCAPE", "DODGE", "FIGHT", "LOOT", "FARM", "HUNT", "ROTATE", "HOLD"],
-                  "fire": "any", "spot": "cover"},
+                  "fire": "any", "spot": "cover",
+                  # recover: hurt and unpressed -> hold fire, stop chasing, sit in cover until regen tops us up
+                  "recover_frac": 0.6, "recover_exit_frac": 0.9, "recover_clear_dist": 45.0, "recover_quiet_s": 5.0},
     },
     # zone
     "zone_margin": 30.0, "zone_margin_frac": 0.4, "zone_slack_s": 10.0,
@@ -145,6 +147,7 @@ class Bot:
         self.roof = None
         self.roof_fail = {}
         self.climb_marked = False
+        self.recovering = False
         self.strafe_sign = 1
         self.strafe_until = 0.0
         self.slow_count = 0
@@ -166,6 +169,7 @@ class Bot:
         c = Ctx(self, obs)
         self.remember(c)
         self.reflex_scan(c)
+        self.recover(c)
         for s in self.profile["states"]:
             if self.wants[s](c):
                 if s != self.state:
@@ -438,6 +442,22 @@ class Bot:
             self.choose_roof(c)
         return self.roof is not None
 
+    # ================= recover =================
+    def recover(self, c):
+        pr = self.profile
+        if "recover_frac" not in pr:
+            return
+        pressed = self.threat_recent(c, pr["recover_quiet_s"]) \
+            or any(d < pr["recover_clear_dist"] for d, _m in c.enemies)
+        if pressed or c.hp_frac >= pr["recover_exit_frac"]:
+            if self.recovering:
+                log(f"[cbot] t={c.t:.1f} recover off hp={c.hp_frac:.2f} pressed={bool(pressed)}")
+            self.recovering = False
+        elif c.hp_frac < pr["recover_frac"] and not self.recovering:
+            log(f"[cbot] t={c.t:.1f} recover on hp={c.hp_frac:.2f}")
+            self.recovering = True
+            self.spot = None  # re-pick the hold spot against the mechs visible now
+
     # ================= state predicates =================
     def want_escape(self, c):
         return self.zone_urgent(c)
@@ -459,6 +479,8 @@ class Bot:
 
     def fight_target(self, c):
         P = PARAMS
+        if self.recovering:
+            return None
         att = self.attacker(c)
         if att and att[0] < P["fire_range"]:
             return att
@@ -529,6 +551,8 @@ class Bot:
 
     def farm_target(self, c):
         P = PARAMS
+        if self.recovering:
+            return None
         if c.hp_frac < P["farm_min_hp"] or c.t > P["farm_until_t"] or c.t - self.last_enemy_t < P["quiet_s"]:
             return None
         for d, m in c.npcs:
@@ -540,7 +564,7 @@ class Bot:
         return self.farm_target(c) is not None
 
     def want_hunt(self, c):
-        return True
+        return not self.recovering
 
     def want_climb(self, c):
         return self.roof_valid(c) and not self.on_roof(c)
@@ -711,6 +735,8 @@ class Bot:
     def pick_target(self, c):
         P = PARAMS
         policy = self.profile["fire"]
+        if self.recovering:
+            return None  # dealing damage resets the regen clock
         attacked = self.threat_recent(c, P["threat_memory_s"])
         if policy == "attacked" and not attacked:
             return None
