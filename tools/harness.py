@@ -196,11 +196,42 @@ def recover():
     print("recover: ok")
 
 
+def range_by_loadout():
+    """Aggro picks its fight band from loadout: gun-only backs off at 40 m, lightning closes in."""
+    hello, obs = load_stream()
+    pr = botmod.PARAMS["strategies"]["aggro"]
+    base = copy.deepcopy(obs[min(50, len(obs) - 1)])
+    base["projectiles"], base["sounds"], base["events"] = [], [], []
+    base["self"]["in_zone"] = True
+    zc = base["zone"]["next_center"]
+    base["self"]["pos"] = [zc[0], zc[1], base["self"]["pos"][2]]
+    gun = base["self"]["weapons"][0]
+    lightning = {"kind": "lightning", "cooldown": 0, "stats": {"range": 45, "cone_deg": 30}}
+    d, ang = (pr["gun_min"] + 30.0) / 2, 0.3
+    for name, loadout, sign in (("gun", [gun, None], -1), ("lightning", [gun, lightning], 1)):
+        botmod.read_strategy = lambda: "aggro"
+        b = botmod.Bot(hello)
+        dots = []
+        for k in range(10):
+            o = copy.deepcopy(base)
+            o["tick"], o["t"] = k, 20.0 + k * 0.1
+            o["self"]["weapons"] = copy.deepcopy(loadout)
+            o["mechs"] = [enemy(1, o["self"], d, ang)]
+            a = b.act(o)
+            valid(a, k)
+            assert b.state == "FIGHT", b.state
+            dots.append(a["move"][0] * math.cos(ang) + a["move"][1] * math.sin(ang))
+        assert sum(dots) * sign > 0, (name, dots)
+    print("range: ok")
+
+
 if __name__ == "__main__":
     if sys.argv[1:2] == ["walk"]:
         for st in sys.argv[2:] or ["survive", "hide", "aggro"]:
             walk(st)
     elif sys.argv[1:2] == ["recover"]:
         recover()
+    elif sys.argv[1:2] == ["range"]:
+        range_by_loadout()
     else:
         main()

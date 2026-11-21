@@ -25,7 +25,8 @@ PARAMS = {
         "aggro": {"states": ["ESCAPE", "DODGE", "FIGHT", "LOOT", "FARM", "HUNT", "ROTATE", "HOLD"],
                   "fire": "any", "spot": "cover",
                   # recover: hurt and unpressed -> hold fire, stop chasing, sit in cover until regen tops us up
-                  "recover_frac": 0.6, "recover_exit_frac": 0.9, "recover_clear_dist": 45.0, "recover_quiet_s": 5.0},
+                  "recover_frac": 0.6, "recover_exit_frac": 0.9, "recover_clear_dist": 45.0, "recover_quiet_s": 5.0,
+                  "gun_min": 50.0, "gun_max": 70.0, "lead_lag_s": 0.075},
     },
     # zone
     "zone_margin": 30.0, "zone_margin_frac": 0.4, "zone_slack_s": 10.0,
@@ -629,6 +630,8 @@ class Bot:
             lo = max(lo, 55.0)
         if self.strategy == "aggro":
             lo, hi = 10.0, P["aggro_close_dist"]
+            if not any(w and w["kind"] in ("lightning", "mortar") for w in c.me["weapons"]):
+                lo, hi = self.profile["gun_min"], self.profile["gun_max"]
         if d < lo:
             radial = -1.0
         elif d > hi:
@@ -793,8 +796,9 @@ class Bot:
             px, py, pz = center
             vx, vy, vz = m["vel"]
             tt = d / speed
+            lag = self.profile.get("lead_lag_s", 0.0)
             for _ in range(2):
-                ax, ay, az = px + vx * tt, py + vy * tt, pz + vz * tt * 0.5
+                ax, ay, az = px + vx * (tt + lag), py + vy * (tt + lag), pz + vz * tt * 0.5
                 tt = math.sqrt((ax - mx) ** 2 + (ay - my) ** 2 + (az - mz) ** 2) / speed
             aim_yaw = math.atan2(ay - my, ax - mx)
             aim_pitch = math.atan2(az - mz, math.hypot(ax - mx, ay - my))
