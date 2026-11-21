@@ -518,6 +518,9 @@ def run(make_bot: Any) -> None:
             except queue.Empty:
                 break
         latest = None
+        skipped_kills = 0  # kill events in observations that the newest one superseded
+        skipped_events = []  # hit/damaged events and seen beams in superseded observations
+        skipped_beams = []
         for raw in batch:
             if raw is None:
                 return
@@ -535,11 +538,21 @@ def run(make_bot: Any) -> None:
                 name = getattr(bot, "name", None) or getattr(make_bot, "__name__", "bot")
                 _send({"type": "ready", "name": str(name)[:32]})
             elif kind == "obs":
+                if latest is not None:
+                    skipped_kills += sum(1 for e in latest.get("events") or [] if e.get("type") == "kill")
+                    skipped_events += [e for e in latest.get("events") or [] if e.get("type") in ("hit", "damaged")]
+                    skipped_beams += latest.get("beams") or []
                 latest = msg
             elif kind == "end":
                 return
         if latest is None:
             continue
+        if skipped_kills:
+            latest["skipped_kills"] = skipped_kills
+        if skipped_events:
+            latest["skipped_events"] = skipped_events
+        if skipped_beams:
+            latest["skipped_beams"] = skipped_beams
         action: Dict[str, Any] = {}
         draw.clear()
         if bot is not None:
