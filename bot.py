@@ -24,7 +24,36 @@ PARAMS = {
         "roof": {"states": ["ESCAPE", "DODGE", "CLIMB", "PERCH", "ROTATE", "HOLD"], "fire": "attacked", "spot": "cover"},
         "aggro": {"states": ["ESCAPE", "DODGE", "FIGHT", "LOOT", "FARM", "HUNT", "ROTATE", "HOLD"],
                   "fire": "any", "spot": "cover"},
+        # range-keeping skirmisher: fights only what threatens it, breaks off when outnumbered, farms when free
+        "squad": {"states": ["ESCAPE", "DODGE", "FLEE", "ROOFTAKE", "DUEL", "SEEK", "HARVEST", "SCOUT", "ROTATE", "HOLD"],
+                  "fire": "any", "spot": "cover",
+                  "weapon_pref": ["laser", "lightning"],
+                  "upgrade_pref_laser": ["plating", "armor", "laser_damage", "laser_charge", "nanites", "gun_damage",
+                                   "gun_rate", "lightning_efficiency", "lightning_range", "gyros", "gun_mag",
+                                   "lightning_chain", "sensors", "servos", "gun_velocity", "reactor", "capacitor",
+                                   "jets", "laser_pierce"]},
     },
+    # squad: engagement triggers
+    "sq_cap": 240.0, "sq_near": 60.0, "sq_hit_s": 6.0, "sq_close_v": 3.0, "sq_close_d": 180.0,
+    "sq_weak_frac": 0.40, "sq_weak_d": 160.0, "sq_aim_rad": 0.22, "sq_aim_d": 190.0, "sq_stick_s": 2.0,
+    # squad: target score
+    "sq_hp_w": 0.2, "sq_low_frac": 0.30, "sq_low_bonus": 100.0, "sq_stick_bonus": 120.0, "sq_hit_bonus": 40.0,
+    "sq_close_bonus": 15.0,
+    # squad: fight distances
+    "sq_r_laser": 120.0, "sq_r_lightning": 28.0, "sq_lt_energy": 12.0, "sq_r_gun": 85.0, "sq_r_vs_lightning": 64.0,
+    "sq_r_vs_mortar": 80.0, "sq_r_npc": 58.0, "sq_r_finish": 14.0, "sq_finish_tgt": 0.38, "sq_finish_me": 0.42,
+    "sq_finish_view": 2,
+    # squad: spot scoring
+    "sq_ring": 6.0, "sq_w_range": 1.1, "sq_w_exposed": 30.0, "sq_exposed_d": 170.0, "sq_w_los": 45.0,
+    "sq_w_cube": 1.5, "sq_cube_pull_d": 40.0, "sq_w_strafe": 4.0, "sq_strafe_s": (0.3, 1.0), "sq_others": 3,
+    # squad: breaking off
+    "sq_lose_hold_s": 1.5, "sq_lose_d": 160.0, "sq_lose2_hp": 0.55, "sq_lose3_hp": 0.80, "sq_lose_hp": 0.35,
+    "sq_lose_gap": 0.10, "sq_press_frac": 0.25, "sq_press_near": 2, "sq_trapped_d": 20.0, "sq_cover_s": 0.5,
+    # squad: loot and farming
+    "sq_cube_r": 70.0, "sq_cube_r_hurt": 40.0, "sq_cube_hurt_hp": 0.5, "sq_laser_seek": 240.0, "sq_pickup_seek": 150.0,
+    "sq_cube_seek": 105.0, "sq_cube_seek_cap": 25.0, "sq_farm_r": 150.0, "sq_farm_hp": 0.5, "sq_farm_give_up_s": 30.0,
+    "sq_farm_ban_s": 60.0, "sq_crate_shoot_d": 28.0, "sq_kill_margin": 0.8,
+    "sq_scout_grid": 70.0, "sq_roof_r": 150.0, "sq_roof_r_fight": 45.0, "sq_roof_max_h": 30.0,
     # zone
     "zone_margin": 30.0, "zone_margin_frac": 0.4, "zone_slack_s": 10.0,
     # health
@@ -44,8 +73,8 @@ PARAMS = {
     "farm_range": 75.0, "farm_min_hp": 0.75, "farm_until_t": 200.0,
     "weapon_pref": ["lightning", "laser", "mortar"],
     "lt_stop_energy": 8.0, "lt_resume_energy": 32.0, "lt_boost_energy": 45.0, "lt_boost_dist": 70.0,
-    "upgrade_pref": ["plating", "armor", "laser_damage", "laser_charge", "lightning_efficiency", "nanites",
-                     "gun_damage", "gun_rate", "gun_mag", "gyros", "lightning_range", "lightning_chain",
+    "upgrade_pref": ["gun_mag", "lightning_efficiency", "plating", "armor", "gun_damage", "gun_rate",
+                     "laser_damage", "laser_charge", "nanites", "gyros", "lightning_range", "lightning_chain",
                      "mortar_reload", "sensors", "servos", "gun_velocity", "reactor", "capacitor", "jets",
                      "mortar_splash", "mortar_velocity", "laser_pierce"],
     # reflexes
@@ -163,6 +192,18 @@ class Bot:
         self.loot_skip = {}         # item id -> t until which it is ignored
         self.lt_dry = False         # lightning paused until energy is back to lt_resume_energy
         self.crate_id = None
+        self.hit_by = {}            # mech id -> t of its last hit on us
+        self.lose_until = -1e9
+        self.cover = None           # (t computed, point or None)
+        self.seen_items = {}        # id -> (kind, pos) for crates and weapon pickups, kept after they leave view
+        self.job = None             # (id, start t): the loot or farm target being worked on
+        self.sq_crate = None
+        self.sq_spot_log = -1e9
+        self.sq_los_t = -1e9
+        self.rooftake_tick = self.rooftake_pick = None
+        self.scouted = set()        # coarse grid points already looked at while searching for a beam weapon
+        self.seek_tick = self.seek_pick = None
+        self.farm_tick = self.farm_pick = None
         self.handlers = {s: getattr(self, "do_" + s.lower()) for s in self.profile["states"]}
         self.wants = {s: getattr(self, "want_" + s.lower()) for s in self.profile["states"]}
         self.timings = []
@@ -218,6 +259,7 @@ class Bot:
                         b = math.atan2(m["pos"][1] - c.y, m["pos"][0] - c.x)
                 if b is not None:
                     self.threat = (b, c.t, by)
+                self.hit_by[by] = c.t
             elif et == "hit":
                 self.last_dealt_t = c.t
             elif et in ("pickup", "upgrade", "took", "kill"):
@@ -230,6 +272,15 @@ class Bot:
                 self.alert = (s["bearing"], c.t)
         if c.enemies:
             self.last_enemy_t = c.t
+        if self.strategy == "squad":
+            for cr in c.obs.get("crates", []):
+                self.seen_items[cr["id"]] = ("crate", cr["pos"])
+            for p in c.obs.get("pickups", []):
+                self.seen_items[p["id"]] = (p["kind"], p["pos"])
+            listed = {it["id"] for it in c.obs.get("crates", [])} | {it["id"] for it in c.obs.get("pickups", [])}
+            for iid in [i for i, (_k, pos) in self.seen_items.items()
+                        if i not in listed and math.hypot(pos[0] - c.x, pos[1] - c.y) < 20.0]:
+                del self.seen_items[iid]
 
     def threat_recent(self, c, s):
         return self.threat is not None and c.t - self.threat[1] < s
@@ -544,7 +595,7 @@ class Bot:
         return self.drop_target(c) is not None
 
     def wanted_weapon(self, kind, c):
-        pref = PARAMS["weapon_pref"]
+        pref = self.profile.get("weapon_pref", PARAMS["weapon_pref"])
         if kind not in pref:
             return False
         held = [w["kind"] for w in c.me["weapons"] if w]
@@ -830,9 +881,513 @@ class Bot:
         cx, cy, _r = c.region
         return mv, False, False, self.threat_look(c, self.watch_yaw(c, math.atan2(c.y - cy, c.x - cx)))
 
+    # ================= squad =================
+    def mech_frac(self, m):
+        hp, mhp = m.get("hp"), m.get("max_hp")
+        if isinstance(hp, (int, float)) and isinstance(mhp, (int, float)) and mhp > 0:
+            return min(1.0, max(0.0, hp / mhp))
+        return 1.0
+
+    def holding(self, c, kind):
+        return any(w and w["kind"] == kind for w in c.me["weapons"])
+
+    def sq_target(self, c):
+        """The mech we are engaged with, or None. A mech only counts once it trips a trigger: near, hit us,
+        closing, weak, or aiming at us. The pick stays engaged for a short while after its last trigger."""
+        if self.lock_tick == c.obs["tick"]:
+            return self.lock_pick
+        P = PARAMS
+        lock_id = self.lock[0] if self.lock and c.t - self.lock[2] < P["sq_stick_s"] else None
+        best, bs = None, 1e18
+        for d, m in c.enemies:
+            if d > P["sq_cap"]:
+                break
+            mid = m["id"]
+            frac = self.mech_frac(m)
+            rx, ry = c.x - m["pos"][0], c.y - m["pos"][1]
+            hit = c.t - self.hit_by.get(mid, -1e9) < P["sq_hit_s"]
+            closing = (m["vel"][0] * rx + m["vel"][1] * ry) / max(d, 1.0) > P["sq_close_v"]
+            aiming = abs(wrap(m["aim"][0] - math.atan2(ry, rx))) < P["sq_aim_rad"]
+            trig = d < P["sq_near"] or hit or (closing and d < P["sq_close_d"]) \
+                or (frac < P["sq_weak_frac"] and d < P["sq_weak_d"]) or (aiming and d < P["sq_aim_d"])
+            if not trig and mid != lock_id:
+                continue
+            hp = m.get("hp")
+            if not isinstance(hp, (int, float)):
+                hp = finite(m.get("max_hp"), 1400.0)
+            s = d + P["sq_hp_w"] * hp
+            if frac <= P["sq_low_frac"]:
+                s -= P["sq_low_bonus"]
+            if mid == lock_id:
+                s -= P["sq_stick_bonus"]
+            if hit:
+                s -= P["sq_hit_bonus"]
+            if closing:
+                s -= P["sq_close_bonus"]
+            if s < bs:
+                best, bs = (d, m, trig), s
+        if best is not None:
+            d, m, trig = best
+            self.lock = (m["id"], m, c.t if trig else self.lock[2])
+            best = (d, m)
+        else:
+            if lock_id is None:
+                self.lock = None
+            att = self.attacker(c)
+            if att and att[1].get("kind") == "npc" and att[0] < 100.0:
+                best = att
+        self.lock_tick, self.lock_pick = c.obs["tick"], best
+        return best
+
+    def sq_range(self, c, m):
+        """Distance to hold from this target, by what we and it carry."""
+        P = PARAMS
+        if m.get("kind") != "mech":
+            return P["sq_r_npc"]
+        if self.mech_frac(m) < P["sq_finish_tgt"] and c.hp_frac > P["sq_finish_me"] \
+                and len(c.enemies) <= P["sq_finish_view"]:
+            return P["sq_r_finish"]
+        theirs = m.get("weapons") or []
+        arc = self.holding(c, "lightning")
+        if self.holding(c, "laser"):
+            r = P["sq_r_laser"]
+        elif arc and c.me["energy"] > P["sq_lt_energy"] and not self.lt_dry:
+            r = P["sq_r_lightning"]
+        else:
+            r = P["sq_r_gun"]
+        if "lightning" in theirs and not arc:
+            r = max(r, P["sq_r_vs_lightning"])
+        if "mortar" in theirs:
+            r = max(r, P["sq_r_vs_mortar"])
+        return r
+
+    def sq_move(self, c, tx, ty, tz, pref, others):
+        """Best of 17 spots (here plus a ring): near the wanted range, target in sight, few other eyes on us."""
+        P = PARAMS
+        w = self.world
+        if c.t > self.strafe_until:
+            self.strafe_sign = self.rng.choice((-1, 1))
+            self.strafe_until = c.t + self.rng.uniform(*P["sq_strafe_s"])
+        bx, by = unit(tx - c.x, ty - c.y)
+        px, py = -by * self.strafe_sign, bx * self.strafe_sign
+        eh = c.eye[2] - c.z
+        airborne = c.z - c.ground > 3.0
+        ring = P["sq_ring"]
+        cube, cd = None, P["sq_cube_pull_d"]
+        for cu in c.obs.get("cubes", []):
+            dd = math.hypot(cu["pos"][0] - c.x, cu["pos"][1] - c.y)
+            if dd < cd and abs(cu["pos"][2] - c.z) < 4:
+                cube, cd = cu["pos"], dd
+        tc = (tx, ty, tz)
+        best, bs = (0.0, 0.0), 1e18
+        for k in range(-1, 16):
+            if k < 0:
+                dx = dy = 0.0
+                sx, sy, gz = c.x, c.y, c.z
+            else:
+                a = math.pi * k / 8
+                dx, dy = math.cos(a), math.sin(a)
+                sx, sy = c.x + dx * ring, c.y + dy * ring
+                if airborne:
+                    gz = c.z
+                else:
+                    if not w.clear_ray(c.x, c.y, dx, dy, ring + 2.0):
+                        continue
+                    gz = w.ground(sx, sy)
+            s = P["sq_w_range"] * abs(math.hypot(tx - sx, ty - sy) - pref)
+            if w.los((sx, sy, gz + eh), tc, 2.0):
+                s -= P["sq_w_los"]
+            body = (sx, sy, gz + 4.5)
+            for o in others:
+                if w.los(o, body, 3.0):
+                    s += P["sq_w_exposed"]
+            if cube is not None:
+                s += P["sq_w_cube"] * math.hypot(cube[0] - sx, cube[1] - sy)
+            s -= P["sq_w_strafe"] * (dx * px + dy * py)
+            s += 30.0 * self.region_penalty(c, dx, dy, ahead=ring)
+            if s < bs:
+                best, bs = (dx, dy), s
+        return best
+
+    def sq_others(self, c, m):
+        P = PARAMS
+        out = []
+        for d, o in c.enemies:
+            if d > P["sq_exposed_d"] or len(out) >= P["sq_others"]:
+                break
+            if o is not m:
+                out.append((o["pos"][0], o["pos"][1], o["pos"][2] + 8.0))
+        return out
+
+    def sq_item_ok(self, c, iid, pos):
+        x, y, z = pos
+        if self.loot_skip.get(iid, -1.0) >= c.t:
+            return False
+        if not self.toward_region(c, x, y):
+            # outside the next circle is still fine while the current one holds and there is time to get back
+            zc, zr = c.zone["center"], c.zone["radius"]
+            if math.hypot(x - zc[0], y - zc[1]) > zr - 15.0:
+                return False
+            left = c.zone["shrink_end"] - c.t if c.t >= c.zone["shrink_start"] else \
+                c.zone["shrink_start"] - c.t + (c.zone["shrink_end"] - c.zone["shrink_start"])
+            trip = math.hypot(x - c.x, y - c.y) + max(0.0, c.dist_region(x, y))
+            if trip / c.stats.get("walk_speed", 11.7) + PARAMS["zone_slack_s"] + 10.0 > left:
+                return False
+        return abs(z - c.z) < 4 or z - self.world.ground(x, y) < 3.0
+
+    def sq_work(self, c, iid):
+        """Track time spent on one loot or farm target; False once it has taken too long (then it is banned)."""
+        P = PARAMS
+        if self.job is None or self.job[0] != iid:
+            self.job = (iid, c.t)
+        if c.t - self.job[1] > P["sq_farm_give_up_s"]:
+            log(f"[cbot] t={c.t:.1f} give up on {iid}")
+            self.loot_skip[iid] = c.t + P["sq_farm_ban_s"]
+            self.job = None
+            return False
+        return True
+
+    def sq_walk(self, c, x, y, r):
+        d = math.hypot(x - c.x, y - c.y)
+        if d < 1e-6:
+            return (0.0, 0.0)
+        ux, uy = (x - c.x) / d, (y - c.y) / d
+        if d < 40.0 and (c.z - c.ground > 3.0 or self.world.clear_ray(c.x, c.y, ux, uy, d)):
+            return (ux, uy) if d > r else (0.0, 0.0)
+        return self.go(c, x, y, r)
+
+    # ----- breaking off -----
+    def sq_losing(self, c):
+        P = PARAMS
+        near = 0
+        for d, _m in c.enemies:
+            if d < P["sq_lose_d"]:
+                near += 1
+        tgt = self.sq_target(c)
+        tf = self.mech_frac(tgt[1]) if tgt and tgt[1].get("kind") == "mech" else None
+        if tf is not None and tf < P["sq_press_frac"] and near <= P["sq_press_near"]:
+            return False
+        hp = c.hp_frac
+        return (near >= 2 and hp < P["sq_lose2_hp"]) or (near >= 3 and hp < P["sq_lose3_hp"]) \
+            or (hp < P["sq_lose_hp"] and tf is not None and tf > hp + P["sq_lose_gap"])
+
+    def sq_cover(self, c):
+        """A nearby spot hidden from the closest mechs, or None when there is none (trapped: fight)."""
+        P = PARAMS
+        if self.cover and c.t - self.cover[0] < P["sq_cover_s"]:
+            return self.cover[1]
+        w = self.world
+        threats = [(m["pos"][0], m["pos"][1], m["pos"][2] + 8.0) for d, m in c.enemies[:3] if d < P["sq_lose_d"]]
+        pick = None
+        if threats and c.enemies[0][0] >= P["sq_trapped_d"] and c.z - c.ground < 3.0:
+            comp = w.component(c.x, c.y)
+            here = sum(1 for o in threats if w.los(o, (c.x, c.y, c.z + 4.5), 3.0))
+            if here == 0:
+                pick = (c.x, c.y)
+            else:
+                best, bs, be = None, 1e18, here
+                for k in range(12):
+                    a = math.pi * k / 6
+                    dx, dy = math.cos(a), math.sin(a)
+                    for r in (12.0, 26.0, 44.0):
+                        x, y = c.x + dx * r, c.y + dy * r
+                        nc = w.ncell(x, y)
+                        if nc < 0 or w.blocked[nc] or (comp and w.comp[nc] != comp):
+                            continue
+                        body = (x, y, w.ground(x, y) + 4.5)
+                        ex = sum(1 for o in threats if w.los(o, body, 3.0))
+                        s = 0.6 * r + 40.0 * ex + 2.0 * max(0.0, c.dist_region(x, y) + 5.0)
+                        for o in threats:
+                            s += 0.6 * max(0.0, 50.0 - math.hypot(o[0] - x, o[1] - y))
+                        if not w.clear_ray(c.x, c.y, dx, dy, r):
+                            s += 8.0
+                        if s < bs:
+                            best, bs, be = (x, y), s, ex
+                if best is not None and be < here:
+                    pick = best
+        self.cover = (c.t, pick)
+        return pick
+
+    def want_flee(self, c):
+        if self.sq_losing(c):
+            if c.t >= self.lose_until:
+                self.cover = None
+            self.lose_until = c.t + PARAMS["sq_lose_hold_s"]
+        return c.t < self.lose_until and self.sq_cover(c) is not None
+
+    def do_flee(self, c):
+        x, y = self.sq_cover(c)
+        d = math.hypot(x - c.x, y - c.y)
+        mv = self.sq_walk(c, x, y, 1.5)
+        tgt = self.sq_target(c) or (c.enemies[0] if c.enemies else None)
+        look = math.atan2(tgt[1]["pos"][1] - c.y, tgt[1]["pos"][0] - c.x) if tgt else c.me["aim"][0]
+        return mv, d > 8.0 and c.me["energy"] > 15, False, look
+
+    # ----- fighting -----
+    def want_duel(self, c):
+        return self.sq_target(c) is not None
+
+    def sq_fight_loot(self, c, d_tgt):
+        P = PARAMS
+        best, bd = None, P["sq_cube_r_hurt"] if c.hp_frac <= P["sq_cube_hurt_hp"] else P["sq_cube_r"]
+        for cu in c.obs.get("cubes", []):
+            d = math.hypot(cu["pos"][0] - c.x, cu["pos"][1] - c.y)
+            if d < bd and abs(cu["pos"][2] - c.z) < 4 and self.sq_item_ok(c, cu["id"], cu["pos"]):
+                best, bd = cu, d
+        bs = bd if best is not None else 1e18
+        empty = self.slot1_empty(c)
+        for iid, (kind, pos) in self.seen_items.items():
+            if kind == "crate" or not self.wanted_weapon(kind, c):
+                continue
+            d = math.hypot(pos[0] - c.x, pos[1] - c.y)
+            # a first weapon, or the beam, is worth leaving the fight for; anything else only at our feet
+            lim, bonus = (P["sq_laser_seek"], 90.0) if kind == "laser" else \
+                ((P["sq_pickup_seek"], 30.0) if empty else (P["fight_loot_r"], 0.0))
+            if d < lim and d - bonus < bs and self.sq_item_ok(c, iid, pos):
+                best, bd, bs = {"id": iid, "pos": pos}, d, d - bonus
+        if best is None:
+            self.fight_loot = None
+            return None
+        if not self.fight_loot or self.fight_loot[0] != best["id"]:
+            log(f"[cbot] t={c.t:.1f} fight loot {bd:.0f} m, target {d_tgt:.0f} m")
+            self.fight_loot = (best["id"], c.t, 4.0 + bd / 6.0)
+        elif c.t - self.fight_loot[1] > self.fight_loot[2]:
+            self.loot_skip[best["id"]] = c.t + 20.0
+            self.fight_loot = None
+            return None
+        return self.sq_walk(c, best["pos"][0], best["pos"][1], 0.5), bd
+
+    def do_duel(self, c):
+        P = PARAMS
+        d, m = self.sq_target(c)
+        tx, ty, tz = m["pos"]
+        look = math.atan2(ty - c.y, tx - c.x)
+        pref = self.sq_range(c, m)
+        floor = self.boost_floor(c, d)
+        if m.get("kind") == "mech":
+            fl = self.sq_fight_loot(c, d)
+            if fl is not None:
+                return fl[0], fl[1] > 6 and c.me["energy"] > floor, False, look
+        center = (tx, ty, tz + (4.5 if m.get("kind") == "mech" else 1.75))
+        if self.world.los(c.eye, center):
+            self.sq_los_t = c.t
+        elif c.t - self.sq_los_t > 1.0:
+            mv = self.go(c, round(tx / 20) * 20, round(ty / 20) * 20, 12.0)
+            if mv != (0.0, 0.0):
+                return mv, d > pref and c.me["energy"] > floor, False, look
+        mv = self.sq_move(c, tx, ty, center[2], pref, self.sq_others(c, m))
+        if c.t - self.sq_spot_log > 5.0:
+            self.sq_spot_log = c.t
+            log(f"[cbot] t={c.t:.1f} duel {m['id']} d={d:.0f} pref={pref:.0f} seen={len(c.enemies)} "
+                f"tgt_hp={self.mech_frac(m):.2f}")
+        return mv, abs(d - pref) > 30.0 and c.me["energy"] > floor, False, look
+
+    def sq_pick(self, c):
+        """Gunnery target: the engaged mech, else the drone being farmed. Nobody else gets shot at."""
+        cands = []
+        tgt = self.sq_target(c)
+        if tgt:
+            cands.append(tgt)
+        if self.state == "HARVEST":
+            f = self.sq_farm(c)
+            if f and f[0] == "npc":
+                cands.append((f[2], f[1]))
+        for d, m in cands:
+            if d > PARAMS["sq_cap"]:
+                continue
+            center = (m["pos"][0], m["pos"][1], m["pos"][2] + (4.5 if m.get("kind") == "mech" else 1.75))
+            if self.world.los(c.muzzle, center):
+                return d, m, center
+        return None
+
+    def sq_partial_kills(self, c, lw, m):
+        """A part-charged beam that would already finish the target (with a safety margin)."""
+        st = lw["stats"]
+        ch = lw.get("charge", 0)
+        hp = m.get("hp")
+        if ch < st.get("min_charge", 0.15) or not isinstance(hp, (int, float)):
+            return False
+        lo = st.get("min_frac", 0.35)
+        dmg = st.get("damage", 315.0) * (lo + (1.0 - lo) * min(1.0, ch / max(1e-6, st.get("charge", 0.75))))
+        dmg *= self.sq_cube_mult(c)
+        if m.get("kind") == "mech" and "mortar" in (m.get("weapons") or []):
+            dmg *= 1.0 + st.get("cookoff", 0.6)
+        return PARAMS["sq_kill_margin"] * dmg >= hp
+
+    def sq_cube_mult(self, c):
+        cu = self.cfg.get("cubes", {})
+        return 1.0 + cu.get("damage_per_cube", 0.04) * min(c.me.get("cubes", 0), cu.get("stat_cap", 10))
+
+    # ----- loot and farming -----
+    def sq_seek(self, c):
+        if self.seek_tick == c.obs["tick"]:
+            return self.seek_pick
+        P = PARAMS
+        cu_cfg = self.cfg.get("cubes", {})
+        capped = c.me.get("cubes", 0) >= cu_cfg.get("stat_cap", 10)
+        cr = P["sq_cube_seek_cap"] if capped else P["sq_cube_seek"]
+        best, bs = None, 1e18
+        for cu in c.obs.get("cubes", []):
+            d = math.hypot(cu["pos"][0] - c.x, cu["pos"][1] - c.y)
+            if d < cr and d < bs and self.sq_item_ok(c, cu["id"], cu["pos"]):
+                best, bs = (cu["id"], cu["pos"], d), d
+        for iid, (kind, pos) in self.seen_items.items():
+            if kind == "crate" or not self.wanted_weapon(kind, c):
+                continue
+            d = math.hypot(pos[0] - c.x, pos[1] - c.y)
+            lim, bonus = (P["sq_laser_seek"], 90.0) if kind == "laser" else (P["sq_pickup_seek"], 30.0)
+            if d < lim and d - bonus < bs and self.sq_item_ok(c, iid, pos):
+                best, bs = (iid, pos, d), d - bonus
+        if best is not None and not self.sq_work(c, best[0]):
+            best = None
+        self.seek_tick, self.seek_pick = c.obs["tick"], best
+        return best
+
+    def want_seek(self, c):
+        return self.sq_seek(c) is not None
+
+    def do_seek(self, c):
+        _iid, pos, d = self.sq_seek(c)
+        mv = self.sq_walk(c, pos[0], pos[1], 0.5)
+        heading = math.atan2(mv[1], mv[0]) if mv != (0.0, 0.0) else c.me["aim"][0]
+        return mv, d > 60 and c.me["energy"] > 60, False, self.threat_look(c, heading)
+
+    def sq_farm(self, c):
+        """("crate", pos, d, id) or ("npc", mech, d, id): the nearest farmable thing, keeping the current one."""
+        if self.farm_tick == c.obs["tick"]:
+            return self.farm_pick
+        P = PARAMS
+        best, bs = None, 1e18
+        if c.hp_frac > P["sq_farm_hp"]:
+            cur = self.job[0] if self.job else None
+            for iid, (kind, pos) in self.seen_items.items():
+                if kind != "crate":
+                    continue
+                d = math.hypot(pos[0] - c.x, pos[1] - c.y)
+                s = d - (40.0 if iid == cur else 0.0)
+                if d < P["sq_farm_r"] and s < bs and pos[2] - self.world.ground(pos[0], pos[1]) < 3.0 \
+                        and self.sq_item_ok(c, iid, pos):
+                    best, bs = ("crate", pos, d, iid), s
+            if c.me.get("cubes", 0) < self.cfg.get("cubes", {}).get("stat_cap", 10):
+                for d, m in c.npcs:
+                    s = d - (40.0 if m["id"] == cur else 0.0)
+                    if d < P["sq_farm_r"] and s < bs and self.sq_item_ok(c, m["id"], m["pos"]):
+                        best, bs = ("npc", m, d, m["id"]), s
+            if best is not None and not self.sq_work(c, best[3]):
+                best = None
+        self.farm_tick, self.farm_pick = c.obs["tick"], best
+        return best
+
+    def want_harvest(self, c):
+        return self.sq_farm(c) is not None
+
+    def do_harvest(self, c):
+        P = PARAMS
+        kind, what, d, iid = self.sq_farm(c)
+        self.sq_crate = None
+        if kind == "npc":
+            tx, ty, tz = what["pos"]
+            look = math.atan2(ty - c.y, tx - c.x)
+            if d > 90.0 and not self.world.los(c.eye, (tx, ty, tz + 1.75)):
+                return self.go(c, round(tx / 10) * 10, round(ty / 10) * 10, 30.0), False, False, look
+            return self.sq_move(c, tx, ty, tz + 1.75, P["sq_r_npc"], self.sq_others(c, what)), False, False, look
+        x, y, z = what
+        look = math.atan2(y - c.y, x - c.x)
+        seen = self.world.los(c.muzzle, (x, y, z + 1.2))
+        if seen and d < 60.0:
+            for cr in c.obs.get("crates", []):
+                if cr["id"] == iid:
+                    self.sq_crate = cr
+        if d > P["sq_crate_shoot_d"] or not seen:
+            return self.sq_walk(c, x, y, 6.0), False, False, look
+        if self.sq_crate is None:  # in plain sight and not listed: it is gone
+            self.seen_items.pop(iid, None)
+        return (0.0, 0.0), False, False, look
+
+    def sq_roof_item(self, c):
+        """A beam weapon lying on a roof we can jet onto: (id, pos), with self.roof set up for the climb."""
+        if self.rooftake_tick == c.obs["tick"]:
+            return self.rooftake_pick
+        P = PARAMS
+        w = self.world
+        pick = None
+        if not self.holding(c, "laser") and c.hp_frac > P["sq_farm_hp"]:
+            tgt = self.sq_target(c)
+            lim = P["sq_roof_r"] if tgt is None else P["sq_roof_r_fight"]
+            best, bd = None, lim
+            for iid, (kind, pos) in self.seen_items.items():
+                d = math.hypot(pos[0] - c.x, pos[1] - c.y)
+                if kind == "laser" and d < bd and pos[2] - w.ground(pos[0], pos[1]) >= 3.0 \
+                        and self.loot_skip.get(iid, -1.0) < c.t and c.dist_region(pos[0], pos[1]) <= 0:
+                    best, bd = (iid, pos), d
+            if best is not None:
+                iid, pos = best
+                if self.roof is None or self.roof.get("item") != iid:
+                    self.roof = None
+                    for i, rf in enumerate(w.roofs()):
+                        h = rf["top"] - w.ground(rf["c"][0], rf["c"][1])
+                        if abs(rf["top"] - pos[2]) < 2.0 and h <= P["sq_roof_max_h"] \
+                                and abs(w.roof_top(pos[0], pos[1]) - rf["top"]) < 2.0 \
+                                and math.hypot(rf["c"][0] - pos[0], rf["c"][1] - pos[1]) < 60.0 \
+                                and self.roof_fail.get(i, 0) < P["roof_max_tries"]:
+                            ap = w.approach_point(rf, c.x, c.y)
+                            if ap is not None:
+                                self.roof = {"i": i, "rf": rf, "ap": ap, "key": c.region, "item": iid}
+                                log(f"[cbot] t={c.t:.1f} roof item {iid} top={rf['top']:.1f} h={h:.0f}")
+                                break
+                    if self.roof is None:
+                        self.loot_skip[iid] = c.t + P["sq_farm_ban_s"]
+                if self.roof is not None and self.sq_work(c, iid):
+                    pick = best
+        self.rooftake_tick, self.rooftake_pick = c.obs["tick"], pick
+        return pick
+
+    def want_rooftake(self, c):
+        return self.sq_roof_item(c) is not None
+
+    def do_rooftake(self, c):
+        _iid, pos = self.sq_roof_item(c)
+        if self.on_roof(c):
+            mv = unit(pos[0] - c.x, pos[1] - c.y)
+            return mv, False, False, self.threat_look(c, math.atan2(mv[1], mv[0]) if mv != (0.0, 0.0) else c.me["aim"][0])
+        return self.do_climb(c)
+
+    def sq_scout(self, c):
+        """While we lack the beam: the nearest not yet visited point of a coarse grid inside the next circle."""
+        if self.holding(c, "laser"):
+            return None
+        g = PARAMS["sq_scout_grid"]
+        cx, cy, r = c.region
+        i0, j0 = int(round(c.x / g)), int(round(c.y / g))
+        self.scouted.add((i0, j0))
+        best, bd = None, 1e18
+        for j in range(j0 - 4, j0 + 5):
+            for i in range(i0 - 4, i0 + 5):
+                x, y = i * g, j * g
+                if (i, j) in self.scouted or math.hypot(x - cx, y - cy) > r:
+                    continue
+                d = math.hypot(x - c.x, y - c.y)
+                if d < bd:
+                    if not self.world.free(x, y):
+                        self.scouted.add((i, j))
+                        continue
+                    best, bd = (x, y), d
+        return best
+
+    def want_scout(self, c):
+        return self.sq_scout(c) is not None
+
+    def do_scout(self, c):
+        x, y = self.sq_scout(c)
+        mv = self.go(c, x, y, 10.0)
+        heading = math.atan2(mv[1], mv[0]) if mv != (0.0, 0.0) else c.me["aim"][0]
+        return mv, False, False, self.threat_look(c, self.watch_yaw(c, heading))
+
     # ================= gunnery =================
     def pick_target(self, c):
         P = PARAMS
+        if self.strategy == "squad":
+            return self.sq_pick(c)
         policy = self.profile["fire"]
         attacked = self.threat_recent(c, P["threat_memory_s"])
         if policy == "attacked" and not attacked:
@@ -922,6 +1477,8 @@ class Bot:
                 direct_yaw = math.atan2(py - my, px - mx)
                 direct_pitch = math.atan2(pz - mz, math.hypot(px - mx, py - my))
                 charged = lw.get("charge", 0) >= lw["stats"].get("charge", 0.75) * 0.95
+                if self.strategy == "squad" and not charged and self.sq_partial_kills(c, lw, m):
+                    charged = True
                 if lw.get("charge", 0) > 0 or lw["cooldown"] <= 0:
                     aim_yaw, aim_pitch = direct_yaw, direct_pitch
                     fire[laser_slot] = not (charged and self.aimed(c, direct_yaw, direct_pitch, tol))
@@ -941,6 +1498,8 @@ class Bot:
     def crate_target(self, c):
         """A crate worth a few shots: nothing else to shoot, near, on our level, healthy enough. One LOS check."""
         P = PARAMS
+        if self.strategy == "squad":
+            return self.sq_crate if self.state == "HARVEST" else None
         if self.strategy != "aggro" or c.hp_frac < P["crate_min_hp"] or self.state in ("ESCAPE", "DODGE") \
                 or self.zone_urgent(c):
             return None
@@ -1018,15 +1577,9 @@ class Bot:
         if offer and offer.get("choices"):
             ids = [ch["id"] for ch in offer["choices"]]
             pref = P["upgrade_pref"]
-            held = {w["kind"] for w in c.me["weapons"] if w}
-
-            def rank(u):
-                r = pref.index(u) if u in pref else 99
-                for kind in ("laser", "lightning", "mortar"):  # upgrades for a weapon we lack go last
-                    if u.startswith(kind) and kind not in held:
-                        r += 100
-                return r
-            act["pick"] = min(range(len(ids)), key=lambda i: rank(ids[i]))
+            if "upgrade_pref_laser" in self.profile and self.holding(c, "laser"):
+                pref = self.profile["upgrade_pref_laser"]  # the armour-first order suits the beam's standoff style only
+            act["pick"] = min(range(len(ids)), key=lambda i: pref.index(ids[i]) if ids[i] in pref else 99)
         reach = self.cfg["loot"].get("pickup_radius", 4.0)
         weapons = c.me["weapons"]
         for p in c.obs.get("pickups", []):
