@@ -99,7 +99,90 @@ def main():
             states[b.state] = states.get(b.state, 0) + 1
         times.sort()
         print(f"{strat}: p50 {times[len(times) // 2]:.2f} p99 {times[int(len(times) * 0.99)]:.2f} "
-              f"max {times[-1]:.2f} ms  states {states}")
+              f"max {times[-1]:.2f} ms  ffa {b.ffa}  states {states}")
+        ffa_check(strat, hello, obs)
+
+
+def ffa_check(strat, hello, obs):
+    """FFA mode: no detection while alive is explained by our kills; once detected, no unprovoked shot at a
+    mech before ffa_hold_t, return fire on the mech that is hitting us, and never keep a mortar."""
+    botmod.read_strategy = lambda: strat
+    b = botmod.Bot(hello)
+    for k, o in enumerate(obs[:300]):
+        o = copy.deepcopy(o)
+        o["tick"], o["alive"] = k, 15 if k < 50 else 13
+        o["events"] = [{"type": "kill", "target": 9}] if k == 50 else []
+        b.act(o)
+        assert not b.ffa or k < 50, "kill we made was taken as FFA evidence"
+    assert not b.ffa
+    b = botmod.Bot(hello)
+    fired, aim = 0, None
+    for k, o in enumerate(obs[:400]):
+        o = copy.deepcopy(o)
+        o["tick"], o["t"], o["alive"] = k, k * 0.1, 16 if k < 5 else 14
+        me = o["self"]
+        me["aim"] = aim or me["aim"]  # the torso follows the command, unlike the recording
+        o["mechs"] = [enemy(i, me, 40 + 10 * i, 0.5 * i) for i in range(1, 4)]
+        me["weapons"][1] = {"kind": "mortar", "cooldown": 0, "stats": {"speed": 72, "gravity": 22, "cooldown": 2.6}}
+        hit = 200 <= k < 260
+        o["events"] = [{"type": "damaged", "amount": 20, "weapon": "gun", "bearing": 0.5, "by": 1}] if hit else []
+        a = b.act(o)
+        valid(a, k)
+        aim = a["aim"]
+        if k >= 6:
+            assert b.ffa and a.get("drop") == 1, a
+            fired += hit and any(a["fire"])
+            assert k >= 200 or not any(a["fire"]), (k, b.state, a)  # unprovoked: never
+    assert fired, "never returned fire"
+    print(f"{strat}: ffa check ok (returned fire on {fired} decisions)")
+    if "FIGHT" in botmod.PARAMS["strategies"][strat]["states"]:
+        ffa_late_check(strat, hello, obs)
+
+
+def ffa_late_run(strat, hello, obs, mechs, hit_by=None, alive=12, zone_out=False, n=120):
+    """FFA after the hold: feed n decisions with fixed mechs (dist, angle) and return (bot, states, fire count)."""
+    botmod.read_strategy = lambda: strat
+    b = botmod.Bot(hello)
+    b.ffa = True
+    states, fired, aim = {}, 0, None
+    for k, o in enumerate(obs[:n]):
+        o = copy.deepcopy(o)
+        o["tick"], o["t"], o["alive"] = k, 50.0 + k * 0.1, alive
+        me = o["self"]
+        me["aim"] = aim or me["aim"]
+        o["mechs"] = [enemy(i + 1, me, d, ang) for i, (d, ang) in enumerate(mechs)]
+        o["events"] = [{"type": "damaged", "amount": 20, "weapon": "gun", "bearing": mechs[hit_by][1],
+                        "by": hit_by + 1}] if hit_by is not None else []
+        if zone_out:
+            me["in_zone"] = False
+            o["zone"]["next_radius"] = 20
+        a = b.act(o)
+        valid(a, k)
+        aim = a["aim"]
+        states[b.state] = states.get(b.state, 0) + 1
+        fired += any(a["fire"])
+    return b, states, fired
+
+
+def ffa_late_check(strat, hello, obs):
+    """FFA after the hold: engage a lone mech, decline a duel in a crowd (hide instead), fight back when cornered,
+    break off when hit with others near, lapse the crowd rule in the final circle, and always obey the zone."""
+    _b, st, f = ffa_late_run(strat, hello, obs, [(80, 0.5)])
+    assert st.get("FIGHT", 0) > 60, st
+    lone = f
+    crowd = [(80, 0.5), (100, 1.2), (120, 2.0)]
+    b, st, f = ffa_late_run(strat, hello, obs, crowd)
+    assert "FIGHT" not in st and f == 0, (st, f)
+    hide = (st, dict(b.ffa_counts))
+    _b, st, _f = ffa_late_run(strat, hello, obs, crowd, alive=4)
+    assert st.get("FIGHT", 0) > 60, st
+    _b, st, f = ffa_late_run(strat, hello, obs, [(15, 0.5)] + crowd[1:], hit_by=0)
+    assert st.get("FIGHT", 0) > 60 and f, (st, f)
+    _b, st, _f = ffa_late_run(strat, hello, obs, crowd, hit_by=0)
+    assert st.get("EVADE", 0) > 60, st
+    _b, st, _f = ffa_late_run(strat, hello, obs, crowd, hit_by=0, zone_out=True)
+    assert st.get("ESCAPE", 0) > 100, st
+    print(f"{strat}: ffa late check ok (lone fired {lone}; crowd {hide[0]} {hide[1]})")
 
 
 
