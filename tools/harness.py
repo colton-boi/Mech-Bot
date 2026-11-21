@@ -196,11 +196,56 @@ def recover():
     print("recover: ok")
 
 
+def drops():
+    """DROP: aggro goes for a drop even with a far mech visible, skips it within drop_quiet_s of a hit unless
+    already inside the ring, and respects drop_enemy_clear. Strategies without drop_quiet_s keep the quiet_s gate."""
+    hello, obs = load_stream()
+    base = copy.deepcopy(obs[min(50, len(obs) - 1)])
+    base["projectiles"], base["sounds"], base["events"], base["mechs"] = [], [], [], []
+    base["self"]["in_zone"] = True
+    zc = base["zone"]["next_center"]
+    base["self"]["pos"] = [zc[0], zc[1], base["self"]["pos"][2]]
+    tick = [0]
+
+    def step(b, drop_off, mechs=(), events=()):
+        o = copy.deepcopy(base)
+        o["tick"], o["t"] = tick[0], 100.0 + tick[0] * 0.1
+        tick[0] += 1
+        o["self"]["hp"] = 0.95 * o["self"]["max_hp"]
+        o["mechs"], o["events"] = [enemy(i + 1, o["self"], d, a) for i, (d, a) in enumerate(mechs)], list(events)
+        o["drops"] = [{"id": 20000, "pos": [zc[0] + drop_off, zc[1], 0.0], "radius": 8, "lands_in": 0,
+                       "capture_s": 4, "progress": 0, "holder": None}]
+        a = b.act(o)
+        valid(a, o["tick"])
+        return b.state
+
+    hit = {"type": "damaged", "amount": 45, "weapon": "gun", "bearing": 0.3, "by": 1}
+    far = [(100.0, 0.3)]
+    botmod.read_strategy = lambda: "aggro"
+    b = botmod.Bot(hello)
+    dq = b.profile["drop_quiet_s"]
+    assert step(b, -30.0) == "DROP"
+    assert step(b, -30.0, mechs=far) == "DROP", "a far mech does not block the drop"
+    assert step(b, -30.0, mechs=far, events=[hit]) == "FIGHT", "a recent hit outside the ring -> fight"
+    assert step(b, -3.0, mechs=far) == "DROP", "inside the ring a recent hit does not pull us out"
+    for _ in range(int(dq * 10) + 2):
+        st = step(b, -30.0, mechs=far)
+    assert st == "DROP", "quiet for drop_quiet_s -> drop again"
+    assert step(b, -30.0, mechs=[(35.0, math.pi)]) == "FIGHT", "mech near the drop -> skip it"
+    botmod.read_strategy = lambda: "survive"
+    b = botmod.Bot(hello)
+    assert "drop_quiet_s" not in b.profile
+    assert step(b, -30.0, mechs=[(150.0, 0.3)]) != "DROP", "survive keeps the quiet_s gate"
+    print("drops: ok")
+
+
 if __name__ == "__main__":
     if sys.argv[1:2] == ["walk"]:
         for st in sys.argv[2:] or ["survive", "hide", "aggro"]:
             walk(st)
     elif sys.argv[1:2] == ["recover"]:
         recover()
+    elif sys.argv[1:2] == ["drops"]:
+        drops()
     else:
         main()

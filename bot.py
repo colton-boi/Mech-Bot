@@ -22,10 +22,11 @@ PARAMS = {
                     "fire": "engaged", "spot": "cover"},
         "hide": {"states": ["ESCAPE", "DODGE", "ROTATE", "HOLD"], "fire": "attacked", "spot": "corner"},
         "roof": {"states": ["ESCAPE", "DODGE", "CLIMB", "PERCH", "ROTATE", "HOLD"], "fire": "attacked", "spot": "cover"},
-        "aggro": {"states": ["ESCAPE", "DODGE", "FIGHT", "LOOT", "FARM", "HUNT", "ROTATE", "HOLD"],
+        "aggro": {"states": ["ESCAPE", "DODGE", "DROP", "FIGHT", "LOOT", "FARM", "HUNT", "ROTATE", "HOLD"],
                   "fire": "any", "spot": "cover",
                   # recover: hurt and unpressed -> hold fire, stop chasing, sit in cover until regen tops us up
-                  "recover_frac": 0.6, "recover_exit_frac": 0.9, "recover_clear_dist": 45.0, "recover_quiet_s": 5.0},
+                  "recover_frac": 0.6, "recover_exit_frac": 0.9, "recover_clear_dist": 45.0, "recover_quiet_s": 5.0,
+                  "drop_quiet_s": 3.0},
     },
     # zone
     "zone_margin": 30.0, "zone_margin_frac": 0.4, "zone_slack_s": 10.0,
@@ -500,13 +501,17 @@ class Bot:
 
     def drop_target(self, c):
         P = PARAMS
-        if c.t - self.last_enemy_t < P["quiet_s"]:
+        dq = self.profile.get("drop_quiet_s")
+        if dq is None and c.t - self.last_enemy_t < P["quiet_s"]:
             return None
+        hit = dq is not None and self.threat_recent(c, dq)
         for d in c.obs.get("drops", []):
             if d.get("holder") not in (None, c.me["id"]):
                 continue
             x, y = d["pos"][0], d["pos"][1]
             dist = math.hypot(x - c.x, y - c.y)
+            if hit and dist > d.get("radius", 8):
+                continue
             if dist > P["drop_max_dist"] or c.dist_region(x, y) > 0:
                 continue
             if dist / c.stats.get("walk_speed", 11.7) + 3 < d.get("lands_in", 0):
