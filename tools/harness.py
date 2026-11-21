@@ -135,9 +135,35 @@ def walk(strat, decisions=1500):
           f"(radius {zr}) spot {b.spot and tuple(round(v) for v in b.spot[:2])} states {trail}")
 
 
+def skip_check():
+    """Aggro skips a mortar at its feet and drops a held one; survive still takes it."""
+    hello, obs = load_stream()
+    mortar = {"kind": "mortar", "cooldown": 0, "stats": {"speed": 72, "gravity": 22, "cooldown": 2.6}}
+
+    def run(strat, held, pickup):
+        botmod.read_strategy = lambda: strat
+        b = botmod.Bot(hello)
+        o = copy.deepcopy(obs[0])
+        o["mechs"], o["projectiles"], o["events"] = [], [], []
+        x, y, z = o["self"]["pos"]
+        o["self"]["weapons"][1] = held
+        o["pickups"] = [{"id": 8100, "kind": pickup, "pos": [x + 1, y + 1, z]}] if pickup else []
+        a = b.act(o)
+        return a.get("take"), a.get("drop")
+
+    cases = [("aggro", None, "mortar", (None, None)), ("aggro", mortar, None, (None, 1)),
+             ("aggro", mortar, "laser", (8100, 1)), ("survive", None, "mortar", (8100, None))]
+    for strat, held, pickup, want in cases:
+        got = run(strat, copy.deepcopy(held), pickup)
+        print(f"skip {strat} held={held and held['kind']} pickup={pickup}: take/drop {got} "
+              f"{'PASS' if got == want else 'FAIL want ' + str(want)}")
+
+
 if __name__ == "__main__":
     if sys.argv[1:2] == ["walk"]:
         for st in sys.argv[2:] or ["survive", "hide", "aggro"]:
             walk(st)
+    elif sys.argv[1:2] == ["skip"]:
+        skip_check()
     else:
         main()

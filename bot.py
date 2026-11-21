@@ -40,6 +40,7 @@ PARAMS = {
     "drop_max_dist": 170.0, "drop_enemy_clear": 60.0,
     "farm_range": 75.0, "farm_min_hp": 0.75, "farm_until_t": 200.0,
     "weapon_pref": ["lightning", "laser", "mortar"],
+    "weapon_skip": {"aggro": ["mortar"]},
     "upgrade_pref": ["plating", "armor", "nanites", "gyros", "gun_rate", "gun_damage", "lightning_efficiency",
                      "laser_damage", "laser_charge", "mortar_reload", "lightning_range", "lightning_chain",
                      "sensors", "servos", "gun_velocity", "gun_mag", "reactor", "capacitor", "jets",
@@ -498,14 +499,15 @@ class Bot:
         return self.drop_target(c) is not None
 
     def wanted_weapon(self, kind, c):
+        skip = PARAMS["weapon_skip"].get(self.strategy, ())
         pref = PARAMS["weapon_pref"]
-        if kind not in pref:
+        if kind not in pref or kind in skip:
             return False
         held = [w["kind"] for w in c.me["weapons"] if w]
         if kind in held:
             return False
         s1 = c.me["weapons"][1] if len(c.me["weapons"]) > 1 else None
-        return s1 is None or (s1["kind"] in pref and pref.index(kind) < pref.index(s1["kind"]))
+        return s1 is None or s1["kind"] in skip or (s1["kind"] in pref and pref.index(kind) < pref.index(s1["kind"]))
 
     def loot_target(self, c):
         P = PARAMS
@@ -852,6 +854,12 @@ class Bot:
                         continue
                     act["drop"] = 1
                 break
+        if "take" not in act:
+            skip = PARAMS["weapon_skip"].get(self.strategy, ())
+            for i, w in enumerate(weapons):
+                if w and w["kind"] in skip:
+                    act["drop"] = i
+                    break
         gun = weapons[0] if weapons and weapons[0] and weapons[0]["kind"] == "gun" else None
         if gun and not act["fire"][0] and gun.get("reload", 0) <= 0 \
                 and gun.get("ammo", 99) < gun["stats"].get("mag", 12) * 0.5 and not c.enemies:
