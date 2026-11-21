@@ -37,7 +37,7 @@ def scenarios(o, k):
     o = copy.deepcopy(o)
     me = o["self"]
     x, y, z = me["pos"]
-    s = k % 10
+    s = k % 9
     if s == 1:
         o["mechs"] = [enemy(i, me, 30 + 12 * i, 0.4 * i) for i in range(1, 16)]
         o["events"] = [{"type": "damaged", "amount": 45, "weapon": "gun", "bearing": 0.4, "by": 1, "rear": True}]
@@ -68,11 +68,6 @@ def scenarios(o, k):
                        "hp": 350, "max_hp": 350}]
         me["weapons"][1] = {"kind": "laser", "cooldown": 0, "charge": 0.8,
                             "stats": {"charge": 0.75, "cooldown": 1.65, "range": 280}}
-    elif s == 9:
-        # mixed loadouts at similar range: the gun-only mech should win the pick over the nearer laser carrier
-        o["mechs"] = [enemy(6, me, 40, 0.3, ("gun", "laser"), aim_at_me=False),
-                      enemy(7, me, 52, 1.2, ("gun",), aim_at_me=False),
-                      enemy(8, me, 70, 2.0, ("gun", "lightning"), charging=False)]
     return o
 
 

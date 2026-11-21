@@ -30,18 +30,23 @@ PARAMS = {
     # health
     "retreat_frac": 0.4, "resume_frac": 0.85, "retreat_gives_up_dist": 25.0, "retreat_memory_s": 20.0,
     "retreat_quiet_fire_s": 2.0,
+    # aggro back-off: outnumbered and hurt -> break line of sight for a short, capped spell, then fight again
+    "backoff_r": 160.0, "backoff_hp2": 0.55, "backoff_hp3": 0.80, "backoff_hold_s": 1.5, "backoff_max_s": 6.0,
+    "backoff_rest_s": 4.0, "backoff_finish_frac": 0.25, "backoff_los_n": 3,
     "threat_memory_s": 6.0, "face_threat_s": 10.0, "alert_s": 3.0,
     # engagement
     "engage_range": 130.0, "fire_range": 210.0, "fight_min_dist": 40.0, "fight_max_dist": 110.0,
     "aggro_close_dist": 18.0, "aggro_min_dist": 8.0, "aggro_boost_energy": 25.0, "aggro_direct_dist": 60.0,
-    "lock_bonus": 30.0, "lock_memory_s": 2.0, "attacker_bonus": 15.0, "weak_w": 50.0, "gun_only_bonus": 10.0, "laser_w": 10.0, "strafe_s": (1.0, 2.4), "aim_tol_min": 0.012, "aim_at_me_rad": 0.18,
+    "lock_bonus": 30.0, "lock_memory_s": 2.0, "attacker_bonus": 15.0, "weak_w": 50.0, "strafe_s": (1.0, 2.4), "aim_tol_min": 0.012, "aim_at_me_rad": 0.18,
     "max_los_checks": 5,
     # loot and drops
     "loot_detour": 35.0, "cube_detour": 30.0, "weapon_detour_empty": 80.0, "fight_loot_r": 18.0,
-    "fight_weapon_frac": 0.6, "fight_weapon_cap": 80.0, "fight_weapon_blind": 40.0, "fight_loot_give_up_s": 2.5, "quiet_s": 12.0, "loot_enemy_clear": 80.0,
-    "crate_r": 30.0, "crate_min_target": 90.0, "crate_min_hp": 0.6,
+    "fight_weapon_frac": 0.6, "fight_weapon_cap": 80.0, "fight_weapon_blind": 40.0, "fight_loot_give_up_s": 2.5,
+    "fight_cube_far": 70.0, "fight_cube_far_hurt": 40.0, "fight_cube_hurt_hp": 0.5, "closing_speed": 3.0, "fight_cube_blind": 30.0, "quiet_s": 12.0, "loot_enemy_clear": 80.0,
+    "crate_r": 150.0, "crate_min_target": 90.0, "crate_min_hp": 0.5, "engaged_clear": 60.0, "crate_r_fight": 30.0, "crate_shoot_d": 25.0,
+    "cube_pull": 90.0,
     "drop_max_dist": 170.0, "drop_enemy_clear": 60.0,
-    "farm_range": 75.0, "farm_min_hp": 0.75, "farm_until_t": 200.0,
+    "farm_range": 150.0, "farm_min_hp": 0.5, "farm_give_up_s": 30.0, "farm_ban_s": 60.0,
     "weapon_pref": ["lightning", "laser", "mortar"],
     "lt_stop_energy": 8.0, "lt_resume_energy": 32.0, "lt_boost_energy": 45.0, "lt_boost_dist": 70.0,
     "upgrade_pref": ["gun_mag", "lightning_efficiency", "plating", "armor", "gun_damage", "gun_rate",
@@ -49,7 +54,7 @@ PARAMS = {
                      "mortar_reload", "sensors", "servos", "gun_velocity", "reactor", "capacitor", "jets",
                      "mortar_splash", "mortar_velocity", "laser_pierce"],
     # reflexes
-    "shell_margin": 5.0, "laser_dodge_rad": 0.12, "laser_dodge_dist": 140.0, "laser_dodge_close": 0.35, "laser_cover_step": 8.0, "stuck_speed": 1.5, "stuck_decisions": 6, "stuck_jet_s": 0.9,
+    "shell_margin": 5.0, "laser_dodge_rad": 0.12, "stuck_speed": 1.5, "stuck_decisions": 6, "stuck_jet_s": 0.9,
     # hold spots
     "spot_search_r": 140.0, "spot_w_cover": 8.0, "spot_w_center": 0.35, "spot_w_enemy": 200.0, "spot_reach": 5.0,
     "scan_amp": 0.9, "scan_rate": 0.5,
@@ -83,6 +88,13 @@ def wrap(a):
 def unit(dx, dy):
     L = math.hypot(dx, dy)
     return (dx / L, dy / L) if L > 1e-9 else (0.0, 0.0)
+
+
+def hp_frac(m):
+    hp, mhp = m.get("hp"), m.get("max_hp")
+    if isinstance(hp, (int, float)) and isinstance(mhp, (int, float)) and mhp > 0:
+        return min(1.0, max(0.0, hp / mhp))
+    return 1.0
 
 
 def finite(v, default=0.0):
@@ -155,9 +167,7 @@ class Bot:
         self.stuck_until = -1.0
         self.stuck_turn = 1
         self.shell_threat = None
-        self.laser_threat = None    # (charging mech, its distance) while its beam line is on us
-        self.laser_dodge = None     # (mech id, t the dodge began)
-        self.charge_seen = {}       # mech id -> t its current laser charge was first seen
+        self.laser_threat = None
         self.lock = None            # (id, last seen mech dict, t)
         self.lock_tick = None
         self.lock_pick = None
@@ -165,6 +175,11 @@ class Bot:
         self.loot_skip = {}         # item id -> t until which it is ignored
         self.lt_dry = False         # lightning paused until energy is back to lt_resume_energy
         self.crate_id = None
+        self.backoff_hot = -1e9     # last t the back-off condition held
+        self.backoff_rest = -1e9    # no back-off before this t (after a capped spell)
+        self.farm_goal = None       # (id, start t)
+        self.farm_ban = {}          # id -> t until which it is not farmed
+        self.loot_goal = None       # (cube id, start t, give-up s)
         self.handlers = {s: getattr(self, "do_" + s.lower()) for s in self.profile["states"]}
         self.wants = {s: getattr(self, "want_" + s.lower()) for s in self.profile["states"]}
         self.timings = []
@@ -257,32 +272,11 @@ class Bot:
             if land and math.hypot(land[0] - c.x, land[1] - c.y) < sr:
                 self.shell_threat = land
         self.laser_threat = None
-        lz = self.cfg["weapons"]["laser"]
-        # a charge cannot be cancelled and fires itself hold_s after full: past that the dodge is stale
-        max_s = lz.get("charge", 0.75) + lz.get("hold_s", 2.0) + 0.2
-        seen = {}
-        for _d, m in c.enemies:
-            if m.get("charging"):
-                seen[m["id"]] = self.charge_seen.get(m["id"], c.t)
-        self.charge_seen = seen
-        keep = self.laser_dodge
         for d, m in c.enemies:
-            if not m.get("charging") or d > PARAMS["laser_dodge_dist"]:
-                continue
-            if keep and keep[0] == m["id"] and c.t - keep[1] < max_s:
-                self.laser_threat = (m, d)  # stay off its line until it lets go, even once out of the cone
-                break
-            to_me = math.atan2(c.y - m["pos"][1], c.x - m["pos"][0])
-            if abs(wrap(m["aim"][0] - to_me)) < PARAMS["laser_dodge_rad"] + math.atan2(4.0, max(d, 1.0)) \
-                    and c.t - seen[m["id"]] < max_s:
-                if self.laser_threat is None or d < self.laser_threat[1]:
-                    self.laser_threat = (m, d)
-        if self.laser_threat is None:
-            self.laser_dodge = None
-        elif not self.laser_dodge or self.laser_dodge[0] != self.laser_threat[0]["id"]:
-            m, d = self.laser_threat
-            self.laser_dodge = (m["id"], c.t)
-            log(f"[cbot] t={c.t:.1f} laser dodge {m['id']} {d:.0f} m charged {c.t - seen[m['id']]:.2f} s")
+            if m.get("charging") and d < 280:
+                to_me = math.atan2(c.y - m["pos"][1], c.x - m["pos"][0])
+                if abs(wrap(m["aim"][0] - to_me)) < PARAMS["laser_dodge_rad"] + math.atan2(4.0, max(d, 1.0)):
+                    self.laser_threat = to_me
 
     def shell_landing(self, pos, vel, g, dt=0.05, ttl=7.0):
         x, y, z = pos
@@ -493,6 +487,38 @@ class Bot:
             return c.hp_frac < P["resume_frac"]
         return c.hp_frac < P["retreat_frac"]
 
+    def engaged(self, c):
+        """Something is on us: a hit within threat memory, or a mech inside engaged_clear."""
+        P = PARAMS
+        return self.threat_recent(c, P["threat_memory_s"]) or any(d < P["engaged_clear"] for d, _m in c.enemies)
+
+    def outnumbered(self, c):
+        """2+ mechs near and hurt, or 3+ near and scratched; fight on when 2 are near and the target is nearly dead."""
+        P = PARAMS
+        n = sum(1 for d, _m in c.enemies if d < P["backoff_r"])
+        if n < 2 or not (c.hp_frac < P["backoff_hp2"] or (n >= 3 and c.hp_frac < P["backoff_hp3"])):
+            return False
+        if n == 2:
+            tgt = self.aggro_target(c)
+            if tgt and hp_frac(tgt[1]) < P["backoff_finish_frac"]:
+                return False
+        return True
+
+    def want_backoff(self, c):
+        """Re-tested every tick, held backoff_hold_s after it clears, each spell capped at backoff_max_s."""
+        P = PARAMS
+        if c.t < self.backoff_rest or not c.enemies:
+            return False
+        if self.outnumbered(c):
+            self.backoff_hot = c.t
+        elif c.t - self.backoff_hot > P["backoff_hold_s"]:
+            return False
+        if self.state == "BACKOFF" and c.t - self.state_since > P["backoff_max_s"]:
+            self.backoff_rest = c.t + P["backoff_rest_s"]
+            log(f"[cbot] t={c.t:.1f} backoff cap hp={c.hp_frac:.2f}")
+            return False
+        return True
+
     def aggro_target(self, c):
         """Kill-focus target: stick to the locked mech, else the nearest weak one. Cached per decision."""
         if self.lock_tick == c.obs["tick"]:
@@ -501,34 +527,17 @@ class Bot:
         att = self.attacker(c)
         lock_id = self.lock[0] if self.lock else None
         best, bs = None, 1e18
-        plain, ps = None, 1e18      # the same pick without the loadout term, to log when it changes the choice
         cands = list(c.enemies)
         if att and all(att[1]["id"] != m["id"] for _d, m in cands):
             cands.append(att)
         for d, m in cands:
-            hp, mhp = m.get("hp"), m.get("max_hp")
-            frac = hp / mhp if isinstance(hp, (int, float)) and isinstance(mhp, (int, float)) and mhp > 0 else 1.0
-            s = d + P["weak_w"] * min(1.0, max(0.0, frac))
+            s = d + P["weak_w"] * hp_frac(m)
             if m["id"] == lock_id:
                 s -= P["lock_bonus"]
             if att and m["id"] == att[1]["id"]:
                 s -= P["attacker_bonus"]
-            if s < ps:
-                plain, ps = (d, m), s
-            # loadout read from what it holds: gun-only mechs are the soft kills, a laser carrier hurts most up close
-            # (scaled by its health so a nearly dead one is still finished)
-            extra = set(m.get("weapons") or ()) - {"gun"}
-            if m.get("kind") != "mech":
-                pass
-            elif not extra:
-                s -= P["gun_only_bonus"]
-            elif "laser" in extra:
-                s += P["laser_w"] * min(1.0, max(0.0, frac))
             if s < bs:
                 best, bs = (d, m), s
-        if best is not None and best[1]["id"] != plain[1]["id"] and best[1]["id"] != lock_id:
-            log(f"[cbot] t={c.t:.1f} loadout pick {best[1]['id']} {best[1].get('weapons')} over {plain[1]['id']} "
-                f"{plain[1].get('weapons')}")
         if best is not None:
             self.lock = (best[1]["id"], best[1], c.t)
         elif self.lock and c.t - self.lock[2] < P["lock_memory_s"]:
@@ -603,10 +612,22 @@ class Bot:
             r = P["weapon_detour_empty"] if self.slot1_empty(c) and p["kind"] != "mortar" else P["loot_detour"]
             if d < r and abs(p["pos"][2] - c.z) < 4 and d < bd:
                 best, bd = p["pos"], d
+        cube_r = P["cube_pull"] if self.strategy == "aggro" and not self.engaged(c) else P["cube_detour"]
         for cu in c.obs.get("cubes", []):
             d = math.hypot(cu["pos"][0] - c.x, cu["pos"][1] - c.y)
-            if d < P["cube_detour"] and abs(cu["pos"][2] - c.z) < 4 and d < bd:
-                best, bd = cu["pos"], d
+            if d < cube_r and abs(cu["pos"][2] - c.z) < 4 and d < bd and self.loot_skip.get(cu["id"], -1.0) < c.t:
+                best, bd = cu, d
+        if best is not None and "id" in best:  # a cube: give up if it takes too long to reach
+            g = self.loot_goal
+            if g is None or g[0] != best["id"]:
+                self.loot_goal = (best["id"], c.t, 4.0 + bd / 8.0)
+                if bd > P["cube_detour"]:
+                    log(f"[cbot] t={c.t:.1f} cube pull {bd:.0f} m")
+            elif c.t - g[1] > g[2]:
+                self.loot_skip[best["id"]] = c.t + 30.0
+                self.loot_goal = None
+                return None
+            return best["pos"]
         return best
 
     def toward_region(self, c, x, y):
@@ -617,7 +638,7 @@ class Bot:
         w = c.me["weapons"]
         return len(w) < 2 or w[1] is None
 
-    def fight_loot_target(self, c, d_tgt):
+    def fight_loot_target(self, c, d_tgt, m):
         """Loot worth grabbing mid-fight: cubes at our feet (kill drops), or a first real weapon nearer than the target."""
         P = PARAMS
         best, bd = None, 1e18
@@ -627,9 +648,14 @@ class Bot:
             return abs(z - c.z) < 4 and self.loot_skip.get(it["id"], -1.0) < c.t and self.toward_region(c, x, y)
 
         cube_r = P["cube_detour"] if d_tgt > P["crate_min_target"] else P["fight_loot_r"]
+        ux, uy = unit(c.x - m["pos"][0], c.y - m["pos"][1])
+        closing = m["vel"][0] * ux + m["vel"][1] * uy > P["closing_speed"]
+        if not closing:
+            cube_r = max(cube_r, P["fight_cube_far_hurt"] if c.hp_frac <= P["fight_cube_hurt_hp"] else P["fight_cube_far"])
         for cu in c.obs.get("cubes", []):
             d = math.hypot(cu["pos"][0] - c.x, cu["pos"][1] - c.y)
-            if d < cube_r and d < bd and ok(cu):
+            if d < cube_r and d < bd and ok(cu) and (d <= P["fight_cube_blind"] or self.world.clear_ray(
+                    c.x, c.y, (cu["pos"][0] - c.x) / d, (cu["pos"][1] - c.y) / d, d)):
                 best, bd = cu, d
         empty = self.slot1_empty(c)
         for p in c.obs.get("pickups", []):
@@ -648,14 +674,43 @@ class Bot:
     def want_loot(self, c):
         return self.loot_target(c) is not None
 
+    def farm_ok(self, c, i):
+        if self.farm_ban.get(i, -1.0) >= c.t:
+            return False
+        g = self.farm_goal
+        if g and g[0] == i and c.t - g[1] > PARAMS["farm_give_up_s"]:
+            self.farm_ban[i] = c.t + PARAMS["farm_ban_s"]
+            self.farm_goal = None
+            log(f"[cbot] t={c.t:.1f} farm give up {i}")
+            return False
+        return True
+
     def farm_target(self, c):
+        """A drone or (aggro) a crate on our level within farm_range, while healthy and nothing is on us."""
         P = PARAMS
-        if c.hp_frac < P["farm_min_hp"] or c.t > P["farm_until_t"] or c.t - self.last_enemy_t < P["quiet_s"]:
+        if c.hp_frac < P["farm_min_hp"]:
             return None
+        aggro = self.strategy == "aggro"
+        if (self.engaged(c) if aggro else c.t - self.last_enemy_t < P["quiet_s"]):
+            return None
+        best = None
         for d, m in c.npcs:
-            if d < P["farm_range"]:
-                return d, m
-        return None
+            if d < P["farm_range"] and self.farm_ok(c, m["id"]):
+                best = (d, m)
+                break
+        if aggro and not self.zone_urgent(c):
+            for cr in c.obs.get("crates", []):
+                x, y, z = cr["pos"]
+                d = math.hypot(x - c.x, y - c.y)
+                if d < P["farm_range"] and (best is None or d < best[0]) and abs(z - c.z) < 4 \
+                        and self.toward_region(c, x, y) and self.farm_ok(c, cr["id"]):
+                    best = (d, cr)
+        if best is None:
+            return None
+        if self.farm_goal is None or self.farm_goal[0] != best[1]["id"]:
+            self.farm_goal = (best[1]["id"], c.t)
+            log(f"[cbot] t={c.t:.1f} farm {'drone' if best[1].get('kind') else 'crate'} {best[1]['id']} {best[0]:.0f} m")
+        return best
 
     def want_farm(self, c):
         return self.farm_target(c) is not None
@@ -693,42 +748,10 @@ class Bot:
             if ax == 0 and ay == 0:
                 ax, ay = math.cos(c.me["aim"][0] + 1.57), math.sin(c.me["aim"][0] + 1.57)
         else:
-            return self.laser_dodge_move(c)
+            b = self.laser_threat
+            ax, ay = math.cos(b + math.pi / 2) * self.strafe_sign, math.sin(b + math.pi / 2) * self.strafe_sign
         mv = self.best_heading(c, lambda dx, dy: dx * ax + dy * ay - self.region_penalty(c, dx, dy), length=8.0)
         return mv, True, False, self.threat_look(c, c.me["aim"][0])
-
-    def laser_dodge_move(self, c):
-        """Off the charging beam's line: perpendicular to its aim on the side we already are, or onto a
-        side that puts a wall between us. Keep closing on the fight target so the dodge never turns into a standoff."""
-        P = PARAMS
-        m, d = self.laser_threat
-        ex, ey, ez = m["pos"]
-        a = m["aim"][0]
-        ux, uy = math.cos(a), math.sin(a)
-        cross = ux * (c.y - ey) - uy * (c.x - ex)
-        sign = (1 if cross > 0 else -1) if abs(cross) > 0.5 else self.strafe_sign
-        eye = (ex, ey, ez + c.stats.get("muzzle_height", 7.0))
-        step = P["laser_cover_step"]
-
-        def exposed(sg):
-            nx, ny = c.x - uy * sg * step, c.y + ux * sg * step
-            return self.world.los(eye, (nx, ny, c.z + 4.5))
-
-        if exposed(sign) and not exposed(-sign):
-            sign = -sign
-        self.strafe_sign = sign
-        ax, ay = -uy * sign, ux * sign
-        boost = c.me["energy"] > self.boost_floor(c, d)
-        look = math.atan2(ey - c.y, ex - c.x)
-        tgt = self.fight_target(c) if self.strategy == "aggro" else None
-        if tgt is not None:
-            td, tm = tgt
-            look = math.atan2(tm["pos"][1] - c.y, tm["pos"][0] - c.x)
-            if td > P["aggro_close_dist"]:
-                ax += P["laser_dodge_close"] * math.cos(look)
-                ay += P["laser_dodge_close"] * math.sin(look)
-        mv = self.best_heading(c, lambda dx, dy: dx * ax + dy * ay - self.region_penalty(c, dx, dy), length=8.0)
-        return mv, boost, False, look
 
     def do_retreat(self, c):
         b = self.threat[0]
@@ -742,6 +765,37 @@ class Bot:
 
         mv = self.best_heading(c, score)
         return mv, c.me["energy"] > 25, False, b
+
+    def do_backoff(self, c):
+        """Back away from the crowd toward spots they cannot see, still facing (and shooting at) the target."""
+        P = PARAMS
+        w = self.world
+        ax = ay = 0.0
+        for d, m in c.enemies[:4]:
+            ux, uy = unit(c.x - m["pos"][0], c.y - m["pos"][1])
+            ax += ux / max(d, 5.0)
+            ay += uy / max(d, 5.0)
+        ax, ay = unit(ax, ay)
+        eyes = [(m["pos"][0], m["pos"][1], m["pos"][2] + 8.0) for d, m in c.enemies[:P["backoff_los_n"]] if d < P["backoff_r"]]
+
+        def score(dx, dy):
+            away = dx * ax + dy * ay
+            px, py = c.x + dx * 12, c.y + dy * 12
+            nc = w.ncell(px, py)
+            cov = w.cover[nc] if nc >= 0 else 15
+            s = away + 0.08 * (3 - min(cov, 6)) - self.region_penalty(c, dx, dy)
+            if eyes and away > -0.3:
+                pz = w.ground(px, py) + 4.5
+                s += 0.8 * sum(1 for e in eyes if not w.los(e, (px, py, pz))) / len(eyes)
+            return s
+
+        mv = self.best_heading(c, score, length=10.0)
+        if mv == (0.0, 0.0):  # boxed in: fight it out
+            self.backoff_rest = c.t + 1.0
+        tgt = self.aggro_target(c)
+        m = tgt[1] if tgt else c.enemies[0][1] if c.enemies else None
+        look = math.atan2(m["pos"][1] - c.y, m["pos"][0] - c.x) if m else math.atan2(-ay, -ax)
+        return mv, c.me["energy"] > self.boost_floor(c, tgt[0] if tgt else 999.0), False, look
 
     def do_fight(self, c):
         P = PARAMS
@@ -763,7 +817,7 @@ class Bot:
         elif d > hi:
             radial = 1.0 if self.strategy == "aggro" else 0.0
         if self.strategy == "aggro":
-            it, ld = self.fight_loot_target(c, d)
+            it, ld = self.fight_loot_target(c, d, m)
             if it is not None and self.fight_loot and self.fight_loot[0] == it["id"] \
                     and c.t - self.fight_loot[1] > self.fight_loot[2]:
                 log(f"[cbot] t={c.t:.1f} fight loot give up {ld:.0f} m")
@@ -772,7 +826,8 @@ class Bot:
                 it, ld = None, 0.0
             if it is not None:
                 if not self.fight_loot or self.fight_loot[0] != it["id"]:
-                    log(f"[cbot] t={c.t:.1f} fight loot {ld:.0f} m, target {d:.0f} m")
+                    far = " far" if ld > P["cube_detour"] and it["id"] >= 5000 and it["id"] < 8000 else ""
+                    log(f"[cbot] t={c.t:.1f} fight loot{far} {ld:.0f} m, target {d:.0f} m")
                     self.fight_loot = (it["id"], c.t, P["fight_loot_give_up_s"] + ld / 12.0)
                 x, y = it["pos"][0], it["pos"][1]
                 lx, ly = unit(x - c.x, y - c.y)
@@ -830,6 +885,10 @@ class Bot:
     def do_farm(self, c):
         d, m = self.farm_target(c)
         b = math.atan2(m["pos"][1] - c.y, m["pos"][0] - c.x)
+        if not m.get("kind"):  # crate: walk in close, gunnery shoots it, LOOT takes the cube
+            r = PARAMS["crate_shoot_d"]
+            mv = (0.0, 0.0) if d < r else self.go(c, m["pos"][0], m["pos"][1], r * 0.8)
+            return mv, c.me["energy"] > 70 and d > 60, False, b
         mv = (0.0, 0.0)
         if d > 60:
             mv = self.go(c, m["pos"][0], m["pos"][1], 50.0)
@@ -920,7 +979,7 @@ class Bot:
         cands += [e for e in c.enemies if all(e[1]["id"] != m["id"] for _d, m in cands)]
         if self.state == "FARM":
             ft = self.farm_target(c)
-            if ft:
+            if ft and ft[1].get("kind"):
                 cands.insert(0, ft)
         checks = 0
         for d, m in cands:
@@ -1011,15 +1070,24 @@ class Bot:
     def crate_target(self, c):
         """A crate worth a few shots: nothing else to shoot, near, on our level, healthy enough. One LOS check."""
         P = PARAMS
-        if self.strategy != "aggro" or c.hp_frac < P["crate_min_hp"] or self.state in ("ESCAPE", "DODGE") \
+        if self.strategy != "aggro" or c.hp_frac < P["crate_min_hp"] or self.state in ("ESCAPE", "DODGE", "BACKOFF") \
                 or self.zone_urgent(c):
             return None
-        if any(d < P["crate_min_target"] for d, _m in c.enemies):
+        r = P["crate_r"]
+        if self.state == "FIGHT":  # the target is out of sight: only a near crate, and only while it is far
+            if any(d < P["crate_min_target"] for d, _m in c.enemies):
+                return None
+            r = P["crate_r_fight"]
+        elif self.engaged(c):
             return None
-        best, bd = None, P["crate_r"]
+        goal = self.farm_goal[0] if self.state == "FARM" and self.farm_goal else None
+        best, bd = None, r
         for cr in c.obs.get("crates", []):
             x, y, z = cr["pos"]
             d = math.hypot(x - c.x, y - c.y)
+            if cr["id"] == goal and d < r:
+                best, bd = cr, d
+                break
             if d < bd and abs(z - c.z) < 4 and self.toward_region(c, x, y):
                 best, bd = cr, d
         if best is None:
