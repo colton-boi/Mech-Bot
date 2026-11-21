@@ -32,7 +32,12 @@ PARAMS = {
                                    "gun_rate", "lightning_efficiency", "lightning_range", "gyros", "gun_mag",
                                    "lightning_chain", "sensors", "servos", "gun_velocity", "reactor", "capacitor",
                                    "jets", "laser_pierce"]},
+        # squad while we hold a beam (and in the opening, while still looking for one), aggro otherwise. This entry
+        # is the aggro side: aggro's states, but a beam in pickup reach beats the arc so we can switch back.
+        "hybrid": {"states": ["ESCAPE", "DODGE", "FIGHT", "LOOT", "FARM", "HUNT", "ROTATE", "HOLD"],
+                   "fire": "any", "spot": "cover", "weapon_pref": ["laser", "lightning", "mortar"]},
     },
+    "hy_laser_deadline": 50.0,  # hybrid: no beam by then -> aggro until we pick one up
     # squad: engagement triggers
     "sq_cap": 240.0, "sq_near": 60.0, "sq_hit_s": 6.0, "sq_close_v": 3.0, "sq_close_d": 180.0,
     "sq_weak_frac": 0.40, "sq_weak_d": 160.0, "sq_aim_rad": 0.22, "sq_aim_d": 190.0, "sq_stick_s": 2.0,
@@ -163,6 +168,11 @@ class Bot:
         self.slot = hello.get("slot", 0)
         self.rng = random.Random(hello.get("seed", 0))
         self.strategy = read_strategy()
+        self.hybrid = self.strategy == "hybrid"
+        self.hy_late = False        # hybrid: the opening deadline passed without a beam
+        if self.hybrid:
+            self.brains = {"squad": PARAMS["strategies"]["squad"], "aggro": PARAMS["strategies"]["hybrid"]}
+            self.strategy = "squad"
         self.profile = PARAMS["strategies"][self.strategy]
         m = hello.get("map", {})
         self.world = World(m.get("dir", "/arena"), m.get("files", []), self.cfg["mech"])
@@ -204,8 +214,11 @@ class Bot:
         self.scouted = set()        # coarse grid points already looked at while searching for a beam weapon
         self.seek_tick = self.seek_pick = None
         self.farm_tick = self.farm_pick = None
-        self.handlers = {s: getattr(self, "do_" + s.lower()) for s in self.profile["states"]}
-        self.wants = {s: getattr(self, "want_" + s.lower()) for s in self.profile["states"]}
+        states = set(self.profile["states"])
+        if self.hybrid:
+            states.update(*(b["states"] for b in self.brains.values()))
+        self.handlers = {s: getattr(self, "do_" + s.lower()) for s in states}
+        self.wants = {s: getattr(self, "want_" + s.lower()) for s in states}
         self.timings = []
         gc.collect()
         gc.freeze()
@@ -216,6 +229,8 @@ class Bot:
     def act(self, obs):
         t0 = time.perf_counter()
         c = Ctx(self, obs)
+        if self.hybrid:
+            self.hy_brain(c)
         self.remember(c)
         self.reflex_scan(c)
         for s in self.profile["states"]:
@@ -246,6 +261,22 @@ class Bot:
             log(f"[cbot] act ms p50={ts[len(ts) // 2]:.2f} p99={ts[int(len(ts) * 0.99)]:.2f} max={ts[-1]:.2f}")
         return act
 
+    def hy_brain(self, c):
+        """Hybrid: squad with a beam or during the opening, aggro once the deadline passed without one.
+        The mode only changes when the beam is gained or lost, or once at the deadline."""
+        laser = self.holding(c, "laser")
+        if not laser and c.t >= PARAMS["hy_laser_deadline"]:
+            self.hy_late = True
+        mode = "squad" if laser or not self.hy_late else "aggro"
+        if mode != self.strategy:
+            log(f"[cbot] t={c.t:.1f} brain {self.strategy} -> {mode}")
+            self.strategy, self.profile = mode, self.brains[mode]
+            # per-brain bookkeeping with brain-specific timeouts; the rest is shared or self-expiring
+            self.fight_loot = self.job = None
+            self.lock_tick = self.seek_tick = self.farm_tick = self.rooftake_tick = None
+            if mode == "aggro" and self.roof is not None and "item" in self.roof:
+                self.roof = None
+
     # ================= memory =================
     def remember(self, c):
         for ev in c.obs.get("events", []):
@@ -272,7 +303,7 @@ class Bot:
                 self.alert = (s["bearing"], c.t)
         if c.enemies:
             self.last_enemy_t = c.t
-        if self.strategy == "squad":
+        if self.strategy == "squad" or self.hybrid:
             for cr in c.obs.get("crates", []):
                 self.seen_items[cr["id"]] = ("crate", cr["pos"])
             for p in c.obs.get("pickups", []):
