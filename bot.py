@@ -32,12 +32,7 @@ PARAMS = {
                                    "gun_rate", "lightning_efficiency", "lightning_range", "gyros", "gun_mag",
                                    "lightning_chain", "sensors", "servos", "gun_velocity", "reactor", "capacitor",
                                    "jets", "laser_pierce"]},
-        # squad while we hold a beam (and in the opening, while still looking for one), aggro otherwise. This entry
-        # is the aggro side: aggro's states, but a beam in pickup reach beats the arc so we can switch back.
-        "hybrid": {"states": ["ESCAPE", "DODGE", "FIGHT", "LOOT", "FARM", "HUNT", "ROTATE", "HOLD"],
-                   "fire": "any", "spot": "cover", "weapon_pref": ["laser", "lightning", "mortar"]},
     },
-    "hy_laser_deadline": 50.0,  # hybrid: no beam by then -> aggro until we pick one up
     # squad: engagement triggers
     "sq_cap": 240.0, "sq_near": 60.0, "sq_hit_s": 6.0, "sq_close_v": 3.0, "sq_close_d": 180.0,
     "sq_weak_frac": 0.40, "sq_weak_d": 160.0, "sq_aim_rad": 0.22, "sq_aim_d": 190.0, "sq_stick_s": 2.0,
@@ -51,6 +46,9 @@ PARAMS = {
     # squad: spot scoring
     "sq_ring": 6.0, "sq_w_range": 1.1, "sq_w_exposed": 30.0, "sq_exposed_d": 170.0, "sq_w_los": 45.0,
     "sq_w_cube": 1.5, "sq_cube_pull_d": 40.0, "sq_w_strafe": 4.0, "sq_strafe_s": (0.3, 1.0), "sq_others": 3,
+    # squad: laser peek (charge behind cover, step out to fire, duck back for the cooldown); 0 = off
+    "sq_peek": 1, "sq_peek_cache_s": 0.5, "sq_peek_link": 6.5, "sq_peek_early": 0.6, "sq_peek_hold_s": 1.2,
+    "sq_peek_ban_s": 2.0, "sq_peek_watched": 1, "sq_peek_view": 1.05,
     # squad: breaking off
     "sq_lose_hold_s": 1.5, "sq_lose_d": 160.0, "sq_lose2_hp": 0.55, "sq_lose3_hp": 0.80, "sq_lose_hp": 0.35,
     "sq_lose_gap": 0.10, "sq_press_frac": 0.25, "sq_press_near": 2, "sq_trapped_d": 20.0, "sq_cover_s": 0.5,
@@ -168,11 +166,6 @@ class Bot:
         self.slot = hello.get("slot", 0)
         self.rng = random.Random(hello.get("seed", 0))
         self.strategy = read_strategy()
-        self.hybrid = self.strategy == "hybrid"
-        self.hy_late = False        # hybrid: the opening deadline passed without a beam
-        if self.hybrid:
-            self.brains = {"squad": PARAMS["strategies"]["squad"], "aggro": PARAMS["strategies"]["hybrid"]}
-            self.strategy = "squad"
         self.profile = PARAMS["strategies"][self.strategy]
         m = hello.get("map", {})
         self.world = World(m.get("dir", "/arena"), m.get("files", []), self.cfg["mech"])
@@ -214,11 +207,15 @@ class Bot:
         self.scouted = set()        # coarse grid points already looked at while searching for a beam weapon
         self.seek_tick = self.seek_pick = None
         self.farm_tick = self.farm_pick = None
-        states = set(self.profile["states"])
-        if self.hybrid:
-            states.update(*(b["states"] for b in self.brains.values()))
-        self.handlers = {s: getattr(self, "do_" + s.lower()) for s in states}
-        self.wants = {s: getattr(self, "want_" + s.lower()) for s in states}
+        self.pk = None              # peek plan: {"tid", "hide", "peek", "t", "full_t", "phase"}
+        self.pk_ban = -1e9
+        self.pk_tick = None         # tick on which the plan wants the trigger held (no line of sight needed)
+        self.pk_cd = 0.0            # laser cooldown last tick, to spot releases
+        self.pk_last = None         # (tick, phase) of the plan's last decision
+        self.pk_own = None          # (target id, t charge full or None): a charge the plan started out of sight
+        self.pk_via = "open"        # how the trigger was handled on the last decision (for the shot log)
+        self.handlers = {s: getattr(self, "do_" + s.lower()) for s in self.profile["states"]}
+        self.wants = {s: getattr(self, "want_" + s.lower()) for s in self.profile["states"]}
         self.timings = []
         gc.collect()
         gc.freeze()
@@ -229,8 +226,6 @@ class Bot:
     def act(self, obs):
         t0 = time.perf_counter()
         c = Ctx(self, obs)
-        if self.hybrid:
-            self.hy_brain(c)
         self.remember(c)
         self.reflex_scan(c)
         for s in self.profile["states"]:
@@ -261,22 +256,6 @@ class Bot:
             log(f"[cbot] act ms p50={ts[len(ts) // 2]:.2f} p99={ts[int(len(ts) * 0.99)]:.2f} max={ts[-1]:.2f}")
         return act
 
-    def hy_brain(self, c):
-        """Hybrid: squad with a beam or during the opening, aggro once the deadline passed without one.
-        The mode only changes when the beam is gained or lost, or once at the deadline."""
-        laser = self.holding(c, "laser")
-        if not laser and c.t >= PARAMS["hy_laser_deadline"]:
-            self.hy_late = True
-        mode = "squad" if laser or not self.hy_late else "aggro"
-        if mode != self.strategy:
-            log(f"[cbot] t={c.t:.1f} brain {self.strategy} -> {mode}")
-            self.strategy, self.profile = mode, self.brains[mode]
-            # per-brain bookkeeping with brain-specific timeouts; the rest is shared or self-expiring
-            self.fight_loot = self.job = None
-            self.lock_tick = self.seek_tick = self.farm_tick = self.rooftake_tick = None
-            if mode == "aggro" and self.roof is not None and "item" in self.roof:
-                self.roof = None
-
     # ================= memory =================
     def remember(self, c):
         for ev in c.obs.get("events", []):
@@ -303,7 +282,7 @@ class Bot:
                 self.alert = (s["bearing"], c.t)
         if c.enemies:
             self.last_enemy_t = c.t
-        if self.strategy == "squad" or self.hybrid:
+        if self.strategy == "squad":
             for cr in c.obs.get("crates", []):
                 self.seen_items[cr["id"]] = ("crate", cr["pos"])
             for p in c.obs.get("pickups", []):
@@ -1199,6 +1178,10 @@ class Bot:
             fl = self.sq_fight_loot(c, d)
             if fl is not None:
                 return fl[0], fl[1] > 6 and c.me["energy"] > floor, False, look
+        if P["sq_peek"]:
+            mv = self.sq_peek(c, m, pref)
+            if mv is not None:
+                return mv, False, False, look
         center = (tx, ty, tz + (4.5 if m.get("kind") == "mech" else 1.75))
         if self.world.los(c.eye, center):
             self.sq_los_t = c.t
@@ -1212,6 +1195,156 @@ class Bot:
             log(f"[cbot] t={c.t:.1f} duel {m['id']} d={d:.0f} pref={pref:.0f} seen={len(c.enemies)} "
                 f"tgt_hp={self.mech_frac(m):.2f}")
         return mv, abs(d - pref) > 30.0 and c.me["energy"] > floor, False, look
+
+    # ----- laser peek -----
+    def sq_peek_end(self, c, why, ban=False):
+        if self.pk is not None:
+            log(f"[cbot] t={c.t:.1f} peek end {why} phase={self.pk['phase']}")
+        self.pk = None
+        if ban:
+            self.pk_ban = c.t + PARAMS["sq_peek_ban_s"]
+            self.pk_own = None
+
+    def sq_peek_hold(self, c, lw):
+        """Hold the trigger with no line of sight: the plan wants it, or it is carrying a charge the plan started
+        out of sight (dumping that into a wall wastes it; the old movement looks for a line meanwhile)."""
+        P = PARAMS
+        if not P["sq_peek"]:
+            return False
+        if self.state in ("FLEE", "ESCAPE"):
+            self.pk_own = None      # breaking off: drop the charge as before and run at full speed
+            return False
+        ch = lw.get("charge", 0)
+        if self.pk_tick == c.obs["tick"] and self.pk is not None and self.state == "DUEL":
+            if self.pk_own is None or self.pk_own[0] != self.pk["tid"]:
+                self.pk_own = (self.pk["tid"], None)
+        elif lw["cooldown"] > 0 or ch <= 0:
+            self.pk_own = None
+        if self.pk_own is None:
+            return False
+        full = ch >= lw["stats"].get("charge", 0.75) * 0.95
+        if not full:
+            self.pk_own = (self.pk_own[0], None)
+        elif self.pk_own[1] is None:
+            self.pk_own = (self.pk_own[0], c.t)
+        elif c.t - self.pk_own[1] > P["sq_peek_hold_s"]:
+            self.pk_own = None
+            return False
+        return True
+
+    def sq_peek_pair(self, c, m):
+        """(hide, peek): a ring spot the target cannot see us at, next to one we can shoot it from. Cached."""
+        P = PARAMS
+        w = self.world
+        tx, ty, tz = m["pos"]
+        eye, cen = (tx, ty, tz + 8.0), (tx, ty, tz + 4.5)
+        mh = c.stats.get("muzzle_height", 7.0)
+        top = w.head - 0.2
+        reach = P["sq_ring"] + 1.0
+
+        def hidden(x, y, gz):
+            return not w.los(eye, (x, y, gz + 4.5), 3.0) and not w.los(eye, (x, y, gz + top), 3.0)
+
+        def sees(x, y, gz):
+            return w.los((x, y, gz + mh), cen)
+
+        pk = self.pk
+        if pk is not None and pk["tid"] == m["id"]:
+            if c.t - pk["t"] < P["sq_peek_cache_s"]:
+                return pk
+            (hx, hy), (kx, ky) = pk["hide"], pk["peek"]
+            if math.hypot(hx - c.x, hy - c.y) < reach and math.hypot(kx - c.x, ky - c.y) < reach + P["sq_peek_link"] \
+                    and (pk["phase"] == "PEEK" or hidden(hx, hy, w.ground(hx, hy))) and sees(kx, ky, w.ground(kx, ky)):
+                pk["t"] = c.t
+                return pk
+        ring = P["sq_ring"]
+        hides, peeks = [], []
+        for k in range(-1, 24):
+            if k < 0:
+                sx, sy, gz = c.x, c.y, c.ground
+            else:
+                # the 16-spot ring of sq_move, plus 8 spots at half its radius
+                r, a = (ring, math.pi * k / 8) if k < 16 else (0.5 * ring, math.pi * (k - 16) / 4 + math.pi / 8)
+                dx, dy = math.cos(a), math.sin(a)
+                if not w.clear_ray(c.x, c.y, dx, dy, r + 2.0):
+                    continue
+                sx, sy = c.x + dx * r, c.y + dy * r
+                gz = w.ground(sx, sy)
+            if abs(gz - c.ground) > 2.0:
+                continue
+            if sees(sx, sy, gz):
+                peeks.append((sx, sy))
+            elif hidden(sx, sy, gz):
+                hides.append((sx, sy))
+        pairs = []
+        link = P["sq_peek_link"]
+        for hx, hy in hides:
+            dh = math.hypot(hx - c.x, hy - c.y)
+            for kx, ky in peeks:
+                dl = math.hypot(kx - hx, ky - hy)
+                if dl <= link:
+                    pairs.append((dh + 0.5 * dl, (hx, hy), (kx, ky)))
+        pairs.sort()
+        for _s, h, kp in pairs[:4]:
+            dl = math.hypot(kp[0] - h[0], kp[1] - h[1])
+            if dl < 1e-6 or w.clear_ray(h[0], h[1], (kp[0] - h[0]) / dl, (kp[1] - h[1]) / dl, dl):
+                if pk is None or pk["tid"] != m["id"]:
+                    pk = {"tid": m["id"], "full_t": None, "phase": None}
+                pk.update(hide=h, peek=kp, t=c.t)
+                return pk
+        return None
+
+    def sq_watched(self, c, m):
+        """The target can see us: we are inside its view cone and in its line of sight."""
+        tx, ty, tz = m["pos"]
+        aim = m.get("aim")
+        if aim and abs(wrap(aim[0] - math.atan2(c.y - ty, c.x - tx))) > PARAMS["sq_peek_view"]:
+            return False
+        return self.world.los((tx, ty, tz + 8.0), (c.x, c.y, c.z + 4.5), 3.0)
+
+    def sq_peek(self, c, m, pref):
+        """Laser fight from cover: charge where the target cannot see us, step out to fire, back for the cooldown.
+        Returns a move, or None to fight as usual."""
+        P = PARAMS
+        lw = next((wp for wp in c.me["weapons"] if wp and wp["kind"] == "laser"), None)
+        if lw is None or m.get("kind") != "mech" or pref == P["sq_r_finish"] or c.z - c.ground > 3.0 \
+                or c.t < self.pk_ban or self.sq_partial_kills(c, lw, m):
+            if self.pk is not None:
+                self.sq_peek_end(c, "skip")
+            return None
+        if self.pk is None and P["sq_peek_watched"] and not self.sq_watched(c, m):
+            return None   # unseen: charging in the open costs nothing, so only hide when the target can see us
+        pk = self.sq_peek_pair(c, m)
+        if pk is None:
+            if self.pk is not None:
+                self.sq_peek_end(c, "nopair")
+            return None
+        if self.pk is None:
+            log(f"[cbot] t={c.t:.1f} peek start {m['id']} d={math.hypot(m['pos'][0] - c.x, m['pos'][1] - c.y):.0f}")
+        self.pk = pk
+        full = lw["stats"].get("charge", 0.75)
+        ch = lw.get("charge", 0)
+        if ch >= full * 0.95:
+            if pk["full_t"] is None:
+                pk["full_t"] = c.t
+        else:
+            pk["full_t"] = None
+        if lw["cooldown"] > 0 and ch <= 0:
+            phase, goal = "COOL", pk["hide"]
+        elif ch >= P["sq_peek_early"] or pk["full_t"] is not None:
+            phase, goal = "PEEK", pk["peek"]
+        else:
+            phase, goal = "CHARGE", pk["hide"]
+        if pk["full_t"] is not None and c.t - pk["full_t"] > P["sq_peek_hold_s"]:
+            self.sq_peek_end(c, "hold", ban=True)
+            return None
+        pk["phase"] = phase
+        self.pk_last = (c.obs["tick"], phase)
+        if phase != "COOL":
+            self.pk_tick = c.obs["tick"]
+        if self.lock and self.lock[0] == m["id"]:
+            self.lock = (m["id"], m, c.t)   # hiding is part of the fight: stay engaged
+        return self.sq_walk(c, goal[0], goal[1], 0.8)
 
     def sq_pick(self, c):
         """Gunnery target: the engaged mech, else the drone being farmed. Nobody else gets shot at."""
@@ -1515,12 +1648,29 @@ class Bot:
                     fire[laser_slot] = not (charged and self.aimed(c, direct_yaw, direct_pitch, tol))
                     if fire[laser_slot] and gun is not None:
                         fire[gun] = fire[gun] and self.aimed(c, direct_yaw, direct_pitch, tol)
+        elif laser_slot is not None and self.sq_peek_hold(c, weapons[laser_slot]):
+            # peek plan: keep (or start) charging out of sight, turned toward where the target will be
+            for d, m in c.enemies:
+                if m["id"] == self.pk_own[0]:
+                    mx, my, mz = c.muzzle
+                    px, py, pz = m["pos"][0], m["pos"][1], m["pos"][2] + 4.5
+                    aim_yaw = math.atan2(py - my, px - mx)
+                    aim_pitch = math.atan2(pz - mz, math.hypot(px - mx, py - my))
+                    break
+            fire[laser_slot] = True
         elif laser_slot is not None and weapons[laser_slot].get("charge", 0) > 0:
             fire[laser_slot] = False
         else:
             cr = self.crate_target(c)
             if cr is not None:
                 aim_yaw, aim_pitch, fire = self.shoot_crate(c, cr, weapons)
+        if PARAMS["sq_peek"] and laser_slot is not None:
+            cd = weapons[laser_slot]["cooldown"]
+            if cd > 0 and self.pk_cd <= 0:
+                log(f"[cbot] t={c.t:.1f} laser shot via={self.pk_via}")
+                self.pk_own = None
+            self.pk_cd = cd
+            self.pk_via = self.pk_last[1] if self.pk_last and self.pk_last[0] == c.obs["tick"] else "open"
         mp = c.stats.get("max_pitch", 1.3)
         np_ = c.stats.get("min_pitch", -0.7)
         aim_pitch = min(mp, max(np_, finite(aim_pitch)))
