@@ -80,7 +80,6 @@ fn points(flat: &[f64]) -> Vec<[f64; 2]> {
 }
 
 impl World {
-    /// Reads `v2/world.json` and `v2/terrain.i16` under `dir` (`hello.map.dir`).
     pub fn load(dir: &Path) -> Result<World, WorldError> {
         let json_path = dir.join("v2/world.json");
         let text = std::fs::read(&json_path).map_err(|e| WorldError::Io(json_path.clone(), e))?;

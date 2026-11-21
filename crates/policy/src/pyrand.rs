@@ -1,6 +1,3 @@
-//! CPython's `random.Random`: MT19937 seeded the way `random.seed(int)` seeds
-//! it. The Python bot draws its strafe timing from one, so matching the stream
-//! makes the port's decisions identical to the original's on the same obs.
 
 const N: usize = 624;
 const M: usize = 397;
@@ -11,7 +8,6 @@ pub struct PyRandom {
 }
 
 impl PyRandom {
-    /// `random.Random(seed)` for a non-negative integer seed.
     pub fn new(seed: u64) -> PyRandom {
         let mut key = vec![seed as u32];
         if seed >> 32 != 0 {
@@ -75,19 +71,16 @@ impl PyRandom {
         y ^ (y >> 18)
     }
 
-    /// `random()`: a float in [0, 1) with 53 random bits.
     pub fn random(&mut self) -> f64 {
         let a = f64::from(self.next_u32() >> 5);
         let b = f64::from(self.next_u32() >> 6);
         (a * 67_108_864.0 + b) * (1.0 / 9_007_199_254_740_992.0)
     }
 
-    /// `uniform(a, b)`.
     pub fn uniform(&mut self, a: f64, b: f64) -> f64 {
         a + (b - a) * self.random()
     }
 
-    /// `_randbelow(n)` for `0 < n < 2^32`: rejection sampling on `n.bit_length()` bits.
     pub fn below(&mut self, n: u32) -> u32 {
         let k = 32 - n.leading_zeros();
         loop {
@@ -98,7 +91,6 @@ impl PyRandom {
         }
     }
 
-    /// `choice((-1, 1))`.
     pub fn sign(&mut self) -> i32 {
         if self.below(2) == 0 {
             -1

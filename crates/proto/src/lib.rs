@@ -1,14 +1,4 @@
-//! Serde types for the `mechfight/1` bot protocol (`mechfight-kit/protocol.md`,
-//! `mechfight.schema.json`).
-//!
-//! These types are the only currency between the simulator, the policy, and the
-//! live bot: the simulator emits [`Obs`] and consumes [`Action`], exactly as the
-//! server does. Unknown fields are ignored on input.
 
-/// A struct of named `f64` numbers with protocol defaults and by-name access.
-///
-/// Upgrade effects address stats by name (`mech.walk_speed`), so every stat
-/// block needs `get`/`get_mut`. A missing field parses as its default.
 macro_rules! stat_struct {
     ($(#[$m:meta])* $name:ident { $($(#[$fm:meta])* $f:ident = $d:expr),* $(,)? }) => {
         $(#[$m])*
@@ -34,9 +24,6 @@ macro_rules! stat_struct {
     };
 }
 
-/// A string enum that keeps values it does not know.
-///
-/// The schema types these fields as plain strings, so a new value must parse.
 macro_rules! open_enum {
     ($(#[$m:meta])* $name:ident { $($v:ident = $s:literal),* $(,)? }) => {
         $(#[$m])*
@@ -77,9 +64,7 @@ pub use obs::*;
 
 use serde::{Deserialize, Serialize};
 
-/// `[x, y]`, or `[yaw, pitch]` for an aim.
 pub type Vec2 = [f64; 2];
-/// `[x east, y north, z up]` in meters.
 pub type Vec3 = [f64; 3];
 
 pub const PROTOCOL: &str = "mechfight/1";
@@ -112,7 +97,6 @@ impl WeaponKind {
     }
 }
 
-/// Every message the server sends a bot.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerMessage {
@@ -142,7 +126,6 @@ pub struct EndMsg {
     pub kills: u32,
 }
 
-/// The bot's answer to `hello`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename = "ready")]
 pub struct Ready {

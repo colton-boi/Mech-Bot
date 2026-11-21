@@ -1,10 +1,3 @@
-//! Trees block vision only: "crowns fade it, trunks stop it" (protocol.md §8, §11).
-//!
-//! The protocol gives two numbers (`rules.canopyDensity`, `rules.canopyBlockT`)
-//! and no formula. This file assumes sight fades as `exp(-density * meters of
-//! crown crossed)` and is blocked below `block_t`, with each crown an ellipsoid
-//! from `crown_base` to `height` above the tree's ground `z`. Both are guesses
-//! to check against recorded matches.
 
 use crate::{Vec3, World};
 
@@ -14,7 +7,6 @@ pub struct CanopyRules {
     pub block_t: f64,
 }
 
-/// One row of `trees.data`. `height` and `crown_base` are measured up from `z`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tree {
     pub x: f64,
@@ -28,7 +20,6 @@ pub struct Tree {
     pub crown_y: f64,
 }
 
-/// Squared distance in the plane from point `c` to segment `a -> b`.
 fn dist2_to_segment(a: Vec3, b: Vec3, c: [f64; 2]) -> f64 {
     let d = [b[0] - a[0], b[1] - a[1]];
     let len2 = d[0] * d[0] + d[1] * d[1];
@@ -41,7 +32,6 @@ fn dist2_to_segment(a: Vec3, b: Vec3, c: [f64; 2]) -> f64 {
 }
 
 impl Tree {
-    /// True when segment `a -> b` passes through the trunk, a cylinder from the ground to the crown base.
     fn trunk_blocks(&self, a: Vec3, b: Vec3) -> bool {
         let d = [b[0] - a[0], b[1] - a[1]];
         let f = [a[0] - self.x, a[1] - self.y];
@@ -68,7 +58,6 @@ impl Tree {
         z0.max(z1) >= self.z && z0.min(z1) <= self.z + self.crown_base
     }
 
-    /// Meters of segment `a -> b` inside the crown ellipsoid.
     fn crown_chord(&self, a: Vec3, b: Vec3) -> f64 {
         let half_h = 0.5 * (self.height - self.crown_base);
         if half_h <= 0.0 || self.crown_r <= 0.0 {
@@ -97,19 +86,15 @@ impl Tree {
 }
 
 impl World {
-    /// Fraction of sight left after the crowns between `a` and `b`: 1 with no
-    /// foliage on the line, 0 when a trunk is on it.
     pub fn canopy_transmission(&self, a: Vec3, b: Vec3) -> f64 {
         let Some(grid) = self.grid() else {
             return self.canopy_transmission_reference(a, b);
         };
         let mut near = Vec::new();
         grid.trees_on(a, b, &mut near);
-        // Ascending indices, so the sum adds the same terms in the same order as the full scan.
         self.transmission_over(a, b, near.into_iter().map(|i| &self.trees[i as usize]))
     }
 
-    /// `canopy_transmission` by scanning every tree. The grid must agree with it.
     #[doc(hidden)]
     pub fn canopy_transmission_reference(&self, a: Vec3, b: Vec3) -> f64 {
         self.transmission_over(a, b, self.trees.iter())
@@ -130,14 +115,10 @@ impl World {
         (-self.canopy.density * foliage).exp()
     }
 
-    /// True when an eye at `a` sees a point at `b` at range: no terrain, prism,
-    /// or trunk on the line, and not too much crown. Callers apply range and
-    /// the yaw wedge first, and skip the canopy test inside `near_range`.
     pub fn sight(&self, a: Vec3, b: Vec3) -> bool {
         self.los(a, b) && self.canopy_transmission(a, b) >= self.canopy.block_t
     }
 
-    /// `sight` with a `los_hinted` hint for the solid part.
     pub fn sight_hinted(&self, a: Vec3, b: Vec3, hint: &mut u32) -> bool {
         self.los_hinted(a, b, hint) && self.canopy_transmission(a, b) >= self.canopy.block_t
     }

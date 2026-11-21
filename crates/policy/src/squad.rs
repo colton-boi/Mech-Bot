@@ -1,27 +1,8 @@
-//! The practice house squad's shared brain: one record per match that every
-//! house bot reads and writes through an `Arc<Mutex<Squad>>`.
-//!
-//! STRATEGY.md §5a: the squad pools what its members see, hunts the one mech
-//! that is not a member, and grows its hunter count with the number of dead
-//! members k and with time t:
-//!
-//! ```text
-//! hunters = min(alive, 1 + floor(a·k) + floor(max(0, t − t1) / τ)),  everyone once t ≥ T_all
-//! ```
-//!
-//! Every number in [`SquadParams`] is a `GUESS:` fitted by `cargo x validate --fit`
-//! against our real practice scores. Nothing in the protocol settles them.
-//!
-//! Determinism: the arena calls the members' `act` one after another, in slot
-//! order. The squad recomputes hunters and the target once per observation
-//! tick, at the first member's call, from what members posted on earlier
-//! ticks, so slot order never changes a decision.
 
 use proto::Vec3;
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// Skill tier of one house bot (STRATEGY.md §5a). `Easy` ranks weakest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
     Easy,
@@ -45,50 +26,31 @@ impl Tier {
     }
 }
 
-/// Which members become hunters first. STRATEGY.md keeps both readings of the rules.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pick {
-    /// Weakest tier first, then lowest slot.
     Weakest,
-    /// Nearest to the target's last known position first.
     Nearest,
 }
 
-/// One squad variant. Written and parsed as `a=1/t1=150/tau=45/tall=330/replace=10/ropp=45/aim=1/pick=weak/mix=4.7.4`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SquadParams {
-    /// Hunters added per dead member.
     pub a: f64,
-    /// Seconds before the time ramp starts.
     pub t1: f64,
-    /// Seconds per hunter added by the time ramp.
     pub tau: f64,
-    /// Every living member hunts from this time on.
     pub t_all: f64,
-    /// Seconds before a dead hunter is replaced.
     pub replace_s: f64,
-    /// Non-hunters shoot the target inside this range, meters.
     pub r_opp: f64,
     pub pick: Pick,
-    /// Multiplies every tier's aim noise. The squad's lethality, which the
-    /// schedule alone cannot set while the simulator lacks occlusion and spread.
     pub aim: f64,
-    /// Tiers of plain `house` seats, easy / mid / expert, dealt in slot order.
-    /// Seats past the sum are expert.
     pub mix: [u32; 3],
 }
 
-/// Fitted squad variants, best first. `cargo x validate --fit` rewrites the
-/// lines between the markers; the first entry is the default `house` squad.
-// BEGIN FITTED SQUADS
 pub const FITTED: &[(&str, &str)] = &[
     ("v1", "a=1/t1=150/tau=45/tall=330/replace=10/ropp=45/pick=weak/mix=4.7.4"),
     ("v2", "a=1/t1=150/tau=45/tall=330/replace=10/ropp=45/pick=near/mix=4.7.4"),
-    // Rival teams' reading (analysis/rivals): one more hunter per kill, everyone at 240-300 s, non-hunters fight inside 120 m.
     ("v3", "a=1/t1=1000/tau=45/tall=240/replace=0/ropp=120/pick=weak/mix=4.7.4"),
     ("v4", "a=1/t1=1000/tau=45/tall=300/replace=0/ropp=120/pick=weak/mix=4.7.4"),
 ];
-// END FITTED SQUADS
 
 impl Default for SquadParams {
     fn default() -> Self {
@@ -97,7 +59,6 @@ impl Default for SquadParams {
 }
 
 impl SquadParams {
-    /// Parses `key=value` pairs separated by `/` on top of `base`. Unknown keys and bad values are errors.
     pub fn parse_onto(base: &SquadParams, spec: &str) -> Result<SquadParams, String> {
         let mut p = base.clone();
         for part in spec.split('/').filter(|s| !s.is_empty()) {
@@ -147,7 +108,6 @@ impl SquadParams {
         SquadParams::parse_onto(&base, spec)
     }
 
-    /// A fitted variant by name (`v1`), or `key=value` overrides of the default.
     pub fn lookup(spec: &str) -> Result<SquadParams, String> {
         if spec.contains('=') {
             return SquadParams::parse_onto(&SquadParams::default(), spec);
@@ -160,7 +120,6 @@ impl SquadParams {
         SquadParams::parse(text)
     }
 
-    /// Hunters wanted with `alive` living members, `dead` dead ones, at time `t`.
     pub fn hunters_wanted(&self, alive: usize, dead: usize, t: f64) -> usize {
         if t >= self.t_all {
             return alive;
@@ -170,7 +129,6 @@ impl SquadParams {
         (n.max(0.0) as usize).min(alive)
     }
 
-    /// The tier of the `nth` plain `house` seat.
     pub fn tier_of(&self, nth: usize) -> Tier {
         let [easy, mid, _] = self.mix.map(|n| n as usize);
         if nth < easy {
@@ -198,14 +156,12 @@ impl fmt::Display for SquadParams {
     }
 }
 
-/// Where a non-member was last placed by the squad.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sighting {
     pub id: u32,
     pub pos: Vec3,
     pub vel: Vec3,
     pub t: f64,
-    /// Seen by a member; false when guessed from a damage bearing.
     pub seen: bool,
 }
 
@@ -215,35 +171,28 @@ pub(crate) struct Member {
     pub tier: Tier,
     pub pos: Vec3,
     pub vel: Vec3,
-    /// Tick of the member's last post, `None` before its first.
     pub last_tick: Option<u32>,
     pub alive: bool,
 }
 
-/// What one member reports at a decision.
 pub(crate) struct Post<'a> {
     pub tick: u32,
     pub pos: Vec3,
     pub vel: Vec3,
     pub sightings: &'a [Sighting],
-    /// `Hit` events on members (attacker side) and `Damaged` by members (victim side).
     pub friendly_hits: u64,
     pub friendly_damaged: u64,
 }
 
-/// The shared record. Members hold it in an `Arc<Mutex<_>>`.
 #[derive(Debug)]
 pub struct Squad {
     pub params: SquadParams,
     pub(crate) decide_every: u32,
     pub(crate) members: Vec<Member>,
     updated_tick: Option<u32>,
-    /// Member indices, in the order they became hunters.
     pub(crate) hunters: Vec<usize>,
     last_loss_t: f64,
-    /// Latest sighting per non-member id, written by posts.
     sightings: BTreeMap<u32, Sighting>,
-    /// The target as of this tick's update.
     pub(crate) target: Option<Sighting>,
     friendly_hits: u64,
     friendly_damaged: u64,
@@ -280,13 +229,10 @@ impl Squad {
         self.members.iter().any(|m| m.id == Some(id))
     }
 
-    /// Damage dealt by a member to a member, as counted by attackers and by victims.
-    /// The larger of the two is the honest count: a victim killed outright never reports.
     pub fn friendly_hits(&self) -> u64 {
         self.friendly_hits.max(self.friendly_damaged)
     }
 
-    /// Recomputes who is alive, the hunter set, and the target. Runs once per tick.
     pub(crate) fn update(&mut self, tick: u32, t: f64) {
         if self.updated_tick.is_some_and(|u| u >= tick) {
             return;
@@ -304,7 +250,6 @@ impl Squad {
         if self.hunters.len() < before {
             self.last_loss_t = t;
         }
-        // GUESS: the target is the freshest sighting; a visual beats a bearing guess of the same age.
         self.target = self
             .sightings
             .values()
@@ -345,7 +290,6 @@ impl Squad {
         self.friendly_damaged += post.friendly_damaged;
     }
 
-    /// Positions and velocities of the other living members.
     pub(crate) fn mates(&self, except: usize) -> Vec<(u32, Vec3, Vec3)> {
         self.members
             .iter()
@@ -411,7 +355,6 @@ mod tests {
         for i in [0, 2, 3] {
             squad.post(i, post(2));
         }
-        // Member 1 (the hunter) did not post at tick 2: dead at tick 4.
         squad.update(4, 0.2);
         assert!(!squad.members[1].alive);
         assert!(squad.members.iter().filter(|m| m.alive).count() == 3);
@@ -426,7 +369,6 @@ mod tests {
                 assert!(squad.hunters.is_empty(), "at {t}");
             }
         }
-        // a=1, one dead: two hunters, the easy one first, then the mid.
         assert_eq!(squad.hunters, [3, 2]);
     }
 }

@@ -1,15 +1,9 @@
-//! The surface a mech stands on. "You are a vertical cylinder standing on the
-//! surface under your center" (protocol.md §7). Also the disc-against-footprint
-//! geometry the movement rules collide with.
 
 use crate::{Prism, Vec3, World};
 
-/// A disc this much past an edge counts as clear of it, so a disc pushed out
-/// by [`Prism::disc_exit`] no longer overlaps.
 const CLEAR: f64 = 1e-6;
 
 impl Prism {
-    /// The point of the footprint's boundary (ring or hole edge) nearest `(x, y)`, and its distance.
     pub fn nearest_edge(&self, x: f64, y: f64) -> ([f64; 2], f64) {
         let mut best = ([x, y], f64::INFINITY);
         for (a, b) in self.edges() {
@@ -29,13 +23,10 @@ impl Prism {
         best
     }
 
-    /// True when a disc of radius `r` at `(x, y)` overlaps the footprint by more than a touch.
     pub fn overlaps_disc(&self, x: f64, y: f64, r: f64) -> bool {
         self.bbox_near(x, y, r) && (self.contains_xy(x, y) || self.nearest_edge(x, y).1 < r - CLEAR * 0.5)
     }
 
-    /// The shortest horizontal shift that takes a disc of radius `r` at
-    /// `(x, y)` clear of the footprint, or `None` when it already is.
     pub fn disc_exit(&self, x: f64, y: f64, r: f64) -> Option<[f64; 2]> {
         if !self.bbox_near(x, y, r) {
             return None;
@@ -45,7 +36,6 @@ impl Prism {
         if !inside && d >= r - CLEAR * 0.5 {
             return None;
         }
-        // Outward unit normal at q: away from the footprint.
         let n = if d > 1e-9 {
             let k = if inside { 1.0 } else { -1.0 } / d;
             [(q[0] - x) * k, (q[1] - y) * k]
@@ -56,7 +46,6 @@ impl Prism {
         Some([n[0] * shift, n[1] * shift])
     }
 
-    /// Outward normal at a boundary point, for a disc centered exactly on an edge.
     fn outward_normal_at(&self, q: [f64; 2]) -> [f64; 2] {
         let mut best = (f64::INFINITY, [1.0, 0.0]);
         for (a, b) in self.edges() {
@@ -81,12 +70,10 @@ impl Prism {
 }
 
 impl World {
-    /// Prisms whose footprint bounding box comes within `r` of `(x, y)`, with their indices.
     pub fn prisms_near(&self, x: f64, y: f64, r: f64) -> impl Iterator<Item = (usize, &Prism)> {
         self.prisms.iter().enumerate().filter(move |(_, p)| p.bbox_near(x, y, r))
     }
 
-    /// Top of the highest prism over `(x, y)` that is not above `z_max`.
     pub fn roof_at(&self, x: f64, y: f64, z_max: f64) -> Option<f64> {
         self.prisms
             .iter()
@@ -95,16 +82,11 @@ impl World {
             .reduce(f64::max)
     }
 
-    /// Height of the surface under the point `(x, y)` reachable from `z_max`:
-    /// the terrain, or a prism top at or below `z_max` if one is higher.
     pub fn surface_at(&self, x: f64, y: f64, z_max: f64) -> f64 {
         let ground = self.terrain.height(x, y);
         self.roof_at(x, y, z_max).map_or(ground, |roof| roof.max(ground))
     }
 
-    /// Height a vertical cylinder of `radius` rests at when coming down from `z_max`:
-    /// the surface under its center, or a roof its disc still overlaps
-    /// ("you land on the edge instead of dropping into the wall below").
     pub fn ground_under(&self, x: f64, y: f64, radius: f64, z_max: f64) -> f64 {
         let ground = self.surface_at(x, y, z_max);
         self.prisms_near(x, y, radius)
@@ -113,7 +95,6 @@ impl World {
             .fold(ground, f64::max)
     }
 
-    /// Underside of the lowest prism over `(x, y)` whose base is at or above `z`: a bridge deck or an overhang.
     pub fn ceiling_at(&self, x: f64, y: f64, z: f64) -> Option<f64> {
         self.prisms
             .iter()
@@ -122,7 +103,6 @@ impl World {
             .reduce(f64::min)
     }
 
-    /// True when the point is under the terrain or inside a prism.
     pub fn solid_at(&self, p: Vec3) -> bool {
         p[2] < self.terrain.height(p[0], p[1]) || self.prisms.iter().any(|prism| prism.contains(p))
     }

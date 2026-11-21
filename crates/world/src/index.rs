@@ -1,19 +1,7 @@
-//! A uniform grid over the map that lists, per cell, the prisms and trees that
-//! may touch it. `raycast` and `canopy_transmission` walk only the cells a
-//! segment crosses instead of scanning every prism and tree. The answers are
-//! the same as the full scans in `ray.rs` and `canopy.rs`, which stay as the
-//! reference (`*_reference`) and as the fallback.
-//!
-//! The grid is built on the first query. Tests push prisms and trees into a
-//! `World` by hand, so the grid records how many of each it indexed and is
-//! ignored when the counts no longer match.
 
 use crate::{Vec3, World};
 
-/// Cell side in meters.
 const CELL: f64 = 16.0;
-/// Objects are registered in cells this much wider than their footprint, so a
-/// rounding slip in the cell walk near a corner cannot miss one.
 const MARGIN: f64 = 0.5;
 
 #[derive(Clone, Debug)]
@@ -22,15 +10,12 @@ pub(crate) struct Grid {
     min_y: f64,
     nx: usize,
     ny: usize,
-    /// Per cell, ascending indices into `World::prisms`.
     prisms: Vec<Vec<u32>>,
-    /// Per cell, ascending indices into `World::trees`.
     trees: Vec<Vec<u32>>,
     n_prisms: usize,
     n_trees: usize,
 }
 
-/// How far from its trunk a tree can affect sight: the test `canopy.rs` uses.
 pub(crate) fn tree_reach(t: &crate::Tree) -> f64 {
     t.crown_r + (t.crown_x - t.x).hypot(t.crown_y - t.y)
 }
@@ -86,7 +71,6 @@ impl Grid {
     }
 
     fn cell_xy(&self, x: f64, y: f64) -> (usize, usize) {
-        // Clamped to be non-negative first, so truncating is flooring.
         let i = ((x - self.min_x) / CELL).clamp(0.0, (self.nx - 1) as f64) as usize;
         let j = ((y - self.min_y) / CELL).clamp(0.0, (self.ny - 1) as f64) as usize;
         (i, j)
@@ -98,9 +82,6 @@ impl Grid {
         (j0..=j1).flat_map(|j| (i0..=i1).map(move |i| j * self.nx + i)).collect()
     }
 
-    /// Cells the segment's footprint crosses, in order. Every object lies
-    /// inside the grid, so the parts of a segment outside it touch nothing and
-    /// are clipped off first.
     fn walk(&self, a: Vec3, b: Vec3, mut visit: impl FnMut(usize) -> bool) {
         let (gx1, gy1) = (self.min_x + self.nx as f64 * CELL, self.min_y + self.ny as f64 * CELL);
         let d = [b[0] - a[0], b[1] - a[1]];
@@ -173,7 +154,6 @@ impl Grid {
         }
     }
 
-    /// Ascending, distinct indices of the prisms registered in the cells the segment crosses.
     pub(crate) fn prisms_on(&self, a: Vec3, b: Vec3, out: &mut Vec<u32>) {
         out.clear();
         self.walk(a, b, |c| {
@@ -184,10 +164,7 @@ impl Grid {
         out.dedup();
     }
 
-    /// The first prism, registered in a cell the segment crosses, for which
-    /// `hit` is true. Cells are visited from `a` toward `b` and the walk stops there.
     pub(crate) fn find_prism_on(&self, a: Vec3, b: Vec3, mut hit: impl FnMut(usize) -> bool) -> Option<usize> {
-        // Prisms already tested, kept on the stack; past its size a repeat test is only wasted work.
         let mut tested = [u32::MAX; 48];
         let mut n = 0;
         let mut found = None;
@@ -209,7 +186,6 @@ impl Grid {
         found
     }
 
-    /// Ascending, distinct indices of the trees registered in the cells the segment crosses.
     pub(crate) fn trees_on(&self, a: Vec3, b: Vec3, out: &mut Vec<u32>) {
         out.clear();
         self.walk(a, b, |c| {
@@ -222,7 +198,6 @@ impl Grid {
 }
 
 impl World {
-    /// The grid, built on first use, or `None` when prisms or trees were added since.
     pub(crate) fn grid(&self) -> Option<&Grid> {
         let g = self.grid.get_or_init(|| Grid::build(self));
         g.fits(self).then_some(g)

@@ -1,5 +1,3 @@
-//! Port of `mechfight-kit/python/example_bot.py`: walk to the zone, grab a
-//! weapon, shoot the nearest mech. A baseline and a template, not a contender.
 
 use crate::{Params, Policy};
 use proto::{Action, DebugDraw, DebugLine, DebugPoint, Hello, Obs, WeaponKind};
@@ -9,11 +7,9 @@ use world::World;
 
 pub struct Example {
     pub params: Params,
-    /// Attach debug drawings to each action. Off in the simulator, where nothing reads them.
     pub debug: bool,
     reach: f64,
     tick_hz: f64,
-    /// The map, for policies that navigate. `None` if it could not be loaded.
     pub world: Option<Arc<World>>,
 }
 

@@ -1,12 +1,3 @@
-//! Port of `mech-bot/world.py`: the Python bot's own map model. Terrain
-//! heights, prisms rasterized at 2 m, a sampled line of sight, a 4 m
-//! walkability grid with cover distances and connected components, a
-//! budgeted flow field, and roof candidates.
-//!
-//! It deliberately does not use `World::los` or `World::raycast`: the bot's
-//! choices depend on this coarser model, and parity with the Python bot needs
-//! the same answers. Grids that Python keeps in `array("f")` are `f32` here
-//! for the same reason.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -15,7 +6,6 @@ use world::{PrismKind, World};
 
 pub const NONE_TOP: f64 = -1e9;
 const SQRT2: f64 = std::f64::consts::SQRT_2;
-/// Neighbour offsets and step costs, in Python's order.
 pub const NBR: [(i64, i64, f64); 8] = [
     (1, 0, 1.0),
     (-1, 0, 1.0),
@@ -34,16 +24,13 @@ pub struct Roof {
     pub verts: Vec<(f64, f64)>,
 }
 
-/// The static part, shared by every mech in a process.
 pub struct NavMap {
-    // terrain vertex grid
     tx0: f64,
     ty0: f64,
     tstep: f64,
     tnx: usize,
     tny: usize,
     h: Vec<f32>,
-    // prism raster
     rs: f64,
     pub rx0: f64,
     pub ry0: f64,
@@ -51,7 +38,6 @@ pub struct NavMap {
     rh: usize,
     rtop: Vec<f32>,
     rbase: Vec<f32>,
-    // walk grid
     pub cs: f64,
     pub nw: usize,
     pub nh: usize,
@@ -61,7 +47,6 @@ pub struct NavMap {
     pub roofs: Vec<Roof>,
 }
 
-/// Mech numbers the grid depends on.
 #[derive(Clone, Copy, PartialEq)]
 pub struct MechDims {
     pub step_up: f64,
@@ -70,8 +55,6 @@ pub struct MechDims {
 }
 
 impl NavMap {
-    /// One map per directory and mech shape per process. Falls back to a flat
-    /// empty square when the map does not load, so the bot still plays.
     pub fn shared(dir: &str, dims: MechDims) -> Arc<NavMap> {
         type Cache = Mutex<Vec<(PathBuf, [u64; 3], Arc<NavMap>)>>;
         static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -135,7 +118,6 @@ impl NavMap {
         nav
     }
 
-    // ---------- terrain ----------
     pub fn ground(&self, x: f64, y: f64) -> f64 {
         let fx = (x - self.tx0) / self.tstep;
         let fy = (y - self.ty0) / self.tstep;
@@ -152,7 +134,6 @@ impl NavMap {
         top + (bot - top) * ay
     }
 
-    // ---------- prisms ----------
     fn rasterize(&mut self, world: &World, dims: MechDims) -> Vec<u8> {
         let (rs, x0, y0, rw, rh) = (self.rs, self.rx0, self.ry0, self.rw as i64, self.rh as i64);
         let mut rwall = vec![0u8; self.rw * self.rh];
@@ -218,7 +199,6 @@ impl NavMap {
         self.rcell(x, y).map_or(NONE_TOP, |c| f64::from(self.rtop[c]))
     }
 
-    /// True if the segment a->b clears every prism and the terrain, sampled every 1.5 m.
     pub fn los(&self, a: [f64; 3], b: [f64; 3]) -> bool {
         let (dx, dy, dz) = (b[0] - a[0], b[1] - a[1], b[2] - a[2]);
         let d = (dx * dx + dy * dy + dz * dz).sqrt();
@@ -250,7 +230,6 @@ impl NavMap {
         true
     }
 
-    // ---------- walkability ----------
     fn nav_grid(&mut self, rwall: &[u8], max_slope_deg: f64) {
         let k = ((self.cs / self.rs).round() as usize).max(1);
         let (nw, nh) = (self.rw / k, self.rh / k);
@@ -288,7 +267,6 @@ impl NavMap {
                 }
             }
         }
-        // cover[c]: steps to the nearest wall cell, capped at 15
         let mut cover = vec![15u8; n];
         let mut q = VecDeque::new();
         for c in 0..n {
@@ -314,7 +292,6 @@ impl NavMap {
                 }
             }
         }
-        // comp[c]: 4-connected walkable component id (0 = blocked)
         let mut comp = vec![0i32; n];
         let mut label = 0;
         for s in 0..n {
@@ -342,7 +319,6 @@ impl NavMap {
         self.comp = comp;
     }
 
-    /// Walk-grid cell index, or -1 off the grid (Python's convention).
     pub fn ncell(&self, x: f64, y: f64) -> i64 {
         let i = ((x - self.rx0) / self.cs) as i64;
         let j = ((y - self.ry0) / self.cs) as i64;
@@ -411,7 +387,6 @@ impl NavMap {
         best
     }
 
-    // ---------- roofs ----------
     fn roof_candidates(&self, world: &World) -> Vec<Roof> {
         let mut out = Vec::new();
         for p in world.prisms.iter().filter(|p| p.kind == PrismKind::Building) {
@@ -442,8 +417,6 @@ impl NavMap {
         out
     }
 
-    /// A free ground point just outside the roof's footprint, nearest to (fx, fy):
-    /// `(qx, qy, edge_x, edge_y)`.
     pub fn approach_point(&self, roof: &Roof, fx: f64, fy: f64) -> Option<(f64, f64, f64, f64)> {
         let offset = 5.0;
         let (cx, cy) = roof.c;
@@ -487,8 +460,6 @@ struct Job {
     q: VecDeque<usize>,
 }
 
-/// The flow field toward a goal disc, built a budget of queue pops at a time
-/// (Python builds it within a wall-clock budget per decision).
 #[derive(Default)]
 pub struct Flow {
     pub field_key: Option<FieldKey>,
@@ -502,7 +473,6 @@ impl Flow {
         ((x / nav.cs).floor() as i64, (y / nav.cs).floor() as i64, (r / nav.cs).floor() as i64)
     }
 
-    /// Ask for a flow field toward the disc (x, y, r). Work happens in `pump`.
     pub fn request(&mut self, nav: &NavMap, x: f64, y: f64, r: f64) {
         let key = Flow::key(nav, x, y, r);
         if Some(key) == self.field_key || self.job.as_ref().is_some_and(|j| j.key == key) {
@@ -541,7 +511,6 @@ impl Flow {
         self.job = Some(Job { key, dist, q });
     }
 
-    /// Advance the pending search by at most `pops` queue pops (label-correcting, octile costs).
     pub fn pump(&mut self, nav: &NavMap, pops: u64) {
         let Some(job) = self.job.as_mut() else { return };
         let (nw, nh) = (nav.nw as i64, nav.nh as i64);
@@ -585,7 +554,6 @@ impl Flow {
         }
     }
 
-    /// Unit (dx, dy) along the field. `Some((0, 0))` at the goal, `None` with no usable field here.
     pub fn dir(&self, nav: &NavMap, x: f64, y: f64) -> Option<(f64, f64)> {
         let f = self.field.as_ref()?;
         let c = nav.nearest_free(x, y, 2)?;

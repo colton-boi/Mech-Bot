@@ -1,5 +1,3 @@
-//! `hello.config`: the complete rule set. Defaults are the values recorded in
-//! `mechfight-kit/check/stream.jsonl.gz`; a test keeps them equal.
 
 use crate::{SoundKind, Vec2, WeaponKind};
 use serde::{Deserialize, Serialize};
@@ -23,7 +21,6 @@ stat_struct!(BotCfg {
 });
 
 stat_struct!(
-    /// `config.mech`, and `self.stats` (the same numbers after upgrades and cube scaling).
     MechStats {
         radius = 2.5,
         height = 9,
@@ -87,7 +84,6 @@ impl Default for VisionCfg {
 }
 
 stat_struct!(
-    /// Carry range in meters of each sound kind.
     SoundRange {
         step = 40,
         boost = 90,
@@ -108,7 +104,6 @@ stat_struct!(
 );
 
 impl SoundRange {
-    /// Carry range of `kind`, 0 for a kind this build does not know.
     pub fn of(&self, kind: &SoundKind) -> f64 {
         match kind {
             SoundKind::Step => self.step,
@@ -203,7 +198,6 @@ stat_struct!(LightningStats {
     short_s = 2,
 });
 
-/// `config.weapons`, and a mech's per-kind weapon numbers after its upgrades.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WeaponsCfg {
@@ -371,7 +365,6 @@ impl Default for ZoneCfg {
 }
 
 stat_struct!(
-    /// Caps on `action.debug`; the server silently cuts each drawing to these.
     DebugCaps {
         max_lines = 64,
         max_points = 64,
@@ -385,7 +378,6 @@ stat_struct!(
 
 stat_struct!(ReplayCfg { frame_every = 2 });
 
-/// One `mul` or `add` on a stat addressed as `mech.<name>` or `weapons.<kind>.<name>`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Effect {
     pub path: String,
@@ -396,7 +388,6 @@ pub struct Effect {
 }
 
 impl Effect {
-    /// Applies the effect. Returns false, changing nothing, for a path this build does not know.
     pub fn apply(&self, mech: &mut MechStats, weapons: &mut WeaponsCfg) -> bool {
         let mut parts = self.path.split('.');
         let stat = match (parts.next(), parts.next(), parts.next(), parts.next()) {
@@ -420,7 +411,6 @@ pub struct UpgradeDef {
     pub id: String,
     pub name: String,
     pub desc: String,
-    /// Offered only while the mech holds this weapon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires: Option<WeaponKind>,
     pub max: f64,
@@ -442,7 +432,6 @@ pub struct Config {
     pub crates: CratesCfg,
     pub loot: LootCfg,
     pub npc: NpcCfg,
-    /// Absent means the match has no supply drops.
     #[serde(default = "no_drops", skip_serializing_if = "Option::is_none")]
     pub drops: Option<DropsCfg>,
     pub zone: ZoneCfg,
@@ -479,7 +468,6 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Seconds per sim tick.
     pub fn dt(&self) -> f64 {
         1.0 / self.match_.tick_hz
     }

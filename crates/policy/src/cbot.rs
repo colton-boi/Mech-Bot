@@ -1,26 +1,3 @@
-//! Port of the Python submission, `mech-bot/bot.py` ("cbot"). Every strategy of
-//! it is a policy here: `aggro` (the live one), `survive`, `hide`, and `roof`.
-//!
-//! Three layers per decision, as in the original:
-//! - Memory: threats, alerts from sounds, the last enemy sighting, hold spot, roof target.
-//! - Movement: a state machine; each strategy is an ordered priority list of states.
-//! - Gunnery: torso aim and triggers, independent of the legs, gated by the strategy's fire mode.
-//!
-//! plus reflexes (shell and laser dodge, unstick), pickups, and upgrades.
-//!
-//! Parity notes. The map model is `nav.rs`, a port of `world.py`. The strafe
-//! timing draws from CPython's Mersenne Twister seeded with `hello.seed`, as
-//! the original does. Python sizes each flow-field slice by wall clock; here
-//! it is `flow_pops` queue pops per decision, so a seed reproduces a match.
-//! Python rounds the action's numbers (move to 1e-3, aim to 1e-4); this does not.
-//!
-//! Beyond parity, each behind a `Params` switch that is off by default (tests in
-//! `tests/switches.rs`): recover and its line-of-sight variant, a track table of seen
-//! mechs, mode detection (unexplained deaths, squad signatures A and B from unprovoked
-//! attackers), the free-for-all early caution and final, concealed hold spots, exposure break, silent walk,
-//! the centre brake, gun fire gates, loadout fight range, and target-score weights.
-//! Not built: STRATEGY.md 2.1's beam and HP-loss rows and the weak mutual-ignore row,
-//! practice detection, `fight_ratio`, `crate_farm_range`, `dodge_weight`, `reload_cover`.
 
 use crate::nav::{Flow, MechDims, NavMap, NBR, NONE_TOP};
 use crate::pyrand::PyRandom;
@@ -29,9 +6,7 @@ use proto::{Action, ActorKind, ActorObs, Config, DropObs, GameEvent, Hello, Obs,
 use std::f64::consts::PI;
 use std::sync::Arc;
 
-/// Python's weapon preference, best first.
 const WEAPON_PREF: [WeaponKind; 3] = [WeaponKind::Lightning, WeaponKind::Laser, WeaponKind::Mortar];
-/// Python's upgrade preference, best first.
 const UPGRADE_PREF: [&str; 22] = [
     "plating",
     "armor",
@@ -161,12 +136,10 @@ fn heading_or(mv: (f64, f64), fallback: f64) -> f64 {
     }
 }
 
-/// Python's `round(v)`: nearest integer, ties to even.
 fn pround(v: f64) -> i64 {
     v.round_ties_even() as i64
 }
 
-/// Per-decision facts derived from one observation.
 struct Ctx<'a> {
     obs: &'a Obs,
     nav: &'a NavMap,
@@ -179,7 +152,6 @@ struct Ctx<'a> {
     vy: f64,
     hp_frac: f64,
     muzzle: [f64; 3],
-    /// The next circle shrunk by the margin: `(cx, cy, r)`.
     region: (f64, f64, f64),
     enemies: Vec<(f64, &'a ActorObs)>,
     npcs: Vec<(f64, &'a ActorObs)>,
@@ -254,24 +226,18 @@ struct RoofSel {
 
 type Target<'a> = (f64, &'a ActorObs);
 
-/// Mech ids are 0-15 (protocol: NPCs 100+, crates 1000+).
 fn is_mech_id(id: u32) -> bool {
     id < 100
 }
 
-/// What the bot remembers about one mech: the input to mode signatures, concealment,
-/// exposure, and silent walk.
 struct Track {
     id: u32,
     pos: [f64; 3],
     yaw: f64,
     seen_t: f64,
-    /// Last and first time it damaged us.
     hurt_t: f64,
     first_hurt_t: Option<f64>,
-    /// We hit it before it first damaged us, so its attacks say nothing about the mode.
     provoked: bool,
-    /// Signature B: (since, last decision it held) and whether it has counted.
     ignore: Option<(f64, f64)>,
     counted_b: bool,
 }
@@ -299,13 +265,11 @@ impl Track {
         (self.pos[0] - x).hypot(self.pos[1] - y)
     }
 
-    /// Its torso yaw points at (x, y) within `tol`.
     fn aims_at(&self, x: f64, y: f64, tol: f64) -> bool {
         wrap(self.yaw - (y - self.pos[1]).atan2(x - self.pos[0])).abs() < tol
     }
 }
 
-/// Signature A: a pair of unprovoked attackers that spare each other.
 struct Pair {
     ids: (u32, u32),
     since: f64,
@@ -313,23 +277,16 @@ struct Pair {
     counted: bool,
 }
 
-/// Seconds a squad signature must hold before it counts. GUESS: STRATEGY.md 2.1 gives
-/// 3 s for signature B; A uses the same.
 const SIG_HOLD_S: f64 = 3.0;
-/// A held condition survives gaps up to this between decisions.
 const SIG_GAP_S: f64 = 0.3;
-/// Concealment weight while recovering with `recover_los_break`. GUESS: worth 100 m of walking.
 const RECOVER_W_CONCEAL: f64 = 100.0;
-/// Concealment weight of the exposure-break spot, at least. GUESS.
 const BREAK_W_CONCEAL: f64 = 100.0;
-/// Spots ray-tested for concealment per pick, best first by the other terms.
 const CONCEAL_TESTS: usize = 24;
 
 pub struct Cbot {
     pub params: Params,
     p: ParamsF64,
     pub strategy: Strategy,
-    /// Attach a debug label to each action.
     pub debug: bool,
     cfg: Config,
     slot: u32,
@@ -337,13 +294,10 @@ pub struct Cbot {
     nav: Option<Arc<NavMap>>,
     flow: Flow,
     state: St,
-    /// (bearing, t, attacker id)
     threat: Option<(f64, f64, u32)>,
-    /// (bearing, t) from heard sounds
     alert: Option<(f64, f64)>,
     last_enemy_t: f64,
     last_damage_t: f64,
-    /// (x, y, watch yaw)
     spot: Option<(f64, f64, f64)>,
     spot_key: Option<(i64, i64, i64)>,
     roof: Option<RoofSel>,
@@ -358,32 +312,23 @@ pub struct Cbot {
     laser_threat: Option<f64>,
     jet_hint: bool,
     recovering: bool,
-    /// Free-for-all log-odds (STRATEGY.md 2.1) and its inputs.
     mode_l: f64,
     mode_drift: f64,
     prev_alive: Option<u32>,
     prev_t: f64,
     kills: u32,
-    /// Aggro plays survive's rules this decision (`ffa_passive_on`).
     passive: bool,
-    /// Known mechs, sorted by id.
     tracks: Vec<Track>,
     pairs: Vec<Pair>,
-    /// Log-odds taken off by signatures A and B (each capped at 4), and whether any counted.
     sig_a: f64,
     sig_b: f64,
     sig_seen: bool,
     practice: bool,
-    /// The free-for-all final rules apply this decision (`ffa_final_on`).
     final_: bool,
-    /// The free-for-all early caution applies this decision (`ffa_early_on`).
     early: bool,
-    /// Next time a held spot may be re-tested for concealment.
     spot_check_t: f64,
-    /// Exposure-break spot and when it may be re-picked.
     break_spot: Option<(f64, f64)>,
     break_pick_t: f64,
-    /// The gun was on target at this id last decision (`slew_gate`); the last target shot at.
     last_on: Option<u32>,
     last_target: Option<u32>,
 }
@@ -441,7 +386,6 @@ impl Cbot {
         }
     }
 
-    /// The current state's name, for tests and debug labels.
     pub fn state_name(&self) -> &'static str {
         match self.state {
             St::Escape => "ESCAPE",
@@ -473,7 +417,6 @@ impl Cbot {
         nav
     }
 
-    // ================= memory =================
     fn remember(&mut self, c: &Ctx) {
         for ev in &c.obs.events {
             if let GameEvent::Damaged { bearing, by: Some(by), .. } = ev {
@@ -543,7 +486,6 @@ impl Cbot {
         &mut self.tracks[i]
     }
 
-    /// Eye points of the remembered mechs nearest to us, at most 4.
     fn watchers(&self, c: &Ctx) -> Vec<[f64; 3]> {
         let mut near: Vec<(f64, [f64; 3])> = self
             .tracks
@@ -559,7 +501,6 @@ impl Cbot {
         self.threat.is_some_and(|th| c.t - th.1 < s)
     }
 
-    /// The visible actor that hurt us most recently.
     fn attacker<'a>(&self, c: &Ctx<'a>) -> Option<Target<'a>> {
         if !self.threat_recent(c, self.p.threat_memory_s) {
             return None;
@@ -568,9 +509,6 @@ impl Cbot {
         c.all_actors().find(|(_, m)| m.id == by).copied()
     }
 
-    // ================= beyond parity =================
-    /// STRATEGY.md 2.1, the strong signal and the weak drift. GUESS: positive evidence
-    /// only (an unexplained death), since squad signatures are not tracked yet.
     fn read_mode(&mut self, c: &Ctx) {
         let ours = c.obs.events.iter().filter(|e| matches!(e, GameEvent::Kill { target } if *target < 100)).count() as u32;
         self.kills += ours;
@@ -600,10 +538,6 @@ impl Cbot {
         self.early = p.ffa_early_on > 0.5 && !self.practice && !armed && c.t < p.early_until_t && !self.final_;
     }
 
-    /// Squad signatures A and B (STRATEGY.md 2.1), from unprovoked attackers only: a mech
-    /// we shot first and that shoots back proves nothing, since free-for-all bots retaliate.
-    /// GUESS: a signature counts only while each mech in it has damaged us within the last
-    /// SIG_HOLD_S; one stray hit 10 s ago called practice in a passive sim lobby.
     fn read_signatures(&mut self, c: &Ctx) {
         let t = c.t;
         let tol = self.p.aim_at_me_rad;
@@ -613,7 +547,6 @@ impl Cbot {
                 tr.seen_t == t && !tr.provoked && t - tr.hurt_t < 10.0
             })
             .collect();
-        // A: two of them within 100 m, in sight of each other, neither aiming at the other.
         for (k, &i) in att.iter().enumerate() {
             for &j in &att[k + 1..] {
                 let (a, b) = (&self.tracks[i], &self.tracks[j]);
@@ -652,7 +585,6 @@ impl Cbot {
                 }
             }
         }
-        // B: one of them ignores a nearer mech it can see.
         for &i in &att {
             if self.tracks[i].counted_b {
                 continue;
@@ -683,7 +615,6 @@ impl Cbot {
         }
     }
 
-    /// TACTICS.md probe 1, aggro only.
     fn recover(&mut self, c: &Ctx) {
         if self.p.recover_on <= 0.5 || self.strategy != Strategy::Aggro {
             self.recovering = false;
@@ -699,7 +630,6 @@ impl Cbot {
         }
     }
 
-    /// The free-for-all log-odds, for tests and tuning reports.
     pub fn mode_log_odds(&self) -> f64 {
         self.mode_l
     }
@@ -708,27 +638,22 @@ impl Cbot {
         self.recovering
     }
 
-    /// The hold spot `(x, y)` last chosen.
     pub fn hold_spot(&self) -> Option<(f64, f64)> {
         self.spot.map(|(x, y, _)| (x, y))
     }
 
-    /// The mode reads practice: low log-odds and a squad signature seen.
     pub fn is_practice(&self) -> bool {
         self.practice
     }
 
-    /// The free-for-all final rules applied at the last decision.
     pub fn in_final(&self) -> bool {
         self.final_
     }
 
-    /// The free-for-all early caution applied at the last decision.
     pub fn in_early_caution(&self) -> bool {
         self.early
     }
 
-    /// TACTICS #12: walk under the step-sound speed in calm states with a mech remembered nearby.
     fn silent(&self, c: &Ctx) -> bool {
         let p = &self.p;
         p.silent_speed_frac > 0.0
@@ -740,7 +665,6 @@ impl Cbot {
                 .any(|t| c.t - t.seen_t < p.track_memory_s && t.dist(c.x, c.y) < p.silent_range)
     }
 
-    // ================= reflexes =================
     fn reflex_scan(&mut self, c: &Ctx) {
         self.shell_threat = None;
         let mortar = &self.cfg.weapons.mortar;
@@ -788,8 +712,6 @@ impl Cbot {
         (mv, boost, jump)
     }
 
-    // ================= navigation =================
-    /// Unit move toward (x, y): the flow field when it is ready, sampled clear headings otherwise.
     fn go(&mut self, c: &Ctx, x: f64, y: f64, r: f64) -> (f64, f64) {
         let nav = c.nav;
         if c.z - c.ground > 3.0 {
@@ -803,7 +725,6 @@ impl Cbot {
                 }
                 Some(d) => return d,
                 None => {
-                    // the goal is in another walkable component: head straight at it and jet over
                     self.jet_hint = true;
                     return unit(x - c.x, y - c.y);
                 }
@@ -830,7 +751,6 @@ impl Cbot {
         d / c.me.stats.walk_speed + self.p.zone_slack_s > time_left
     }
 
-    // ================= hold spots =================
     fn choose_spot(&mut self, c: &Ctx) {
         let p = &self.p;
         let w = c.nav;
@@ -916,7 +836,6 @@ impl Cbot {
         self.spot_key = Some((pround(cx), pround(cy), pround(r)));
     }
 
-    /// Concealment weight of hold spots this decision; 0 keeps Python's spots.
     fn conceal_w(&self) -> f64 {
         let p = &self.p;
         let mut w = p.spot_w_conceal;
@@ -935,7 +854,6 @@ impl Cbot {
 
     fn ensure_spot(&mut self, c: &Ctx) -> (f64, f64, f64) {
         if self.braking(c) {
-            // the exact next centre (or the free cell nearest it), facing the nearest remembered mech
             let [mut x, mut y] = c.obs.zone.next_center;
             if let Some(cell) = c.nav.nearest_free(x, y, 3).filter(|_| !c.nav.free(x, y)) {
                 (x, y) = c.nav.ncenter(cell);
@@ -951,7 +869,6 @@ impl Cbot {
             Some((x, y, _)) => self.spot_key != Some((pround(cx), pround(cy), pround(r))) || (x - cx).hypot(y - cy) > r.max(8.0),
         };
         if !stale && self.conceal_w() > 0.0 && c.t >= self.spot_check_t {
-            // at most once a second: leave a spot a remembered mech can see
             self.spot_check_t = c.t + 1.0;
             let (x, y, _) = self.spot.expect("not stale");
             let at = [x, y, c.nav.ground(x, y) + 4.5];
@@ -967,7 +884,6 @@ impl Cbot {
         base + self.p.scan_amp * (c.t * self.p.scan_rate + f64::from(self.slot)).sin()
     }
 
-    // ================= roof =================
     fn choose_roof(&mut self, c: &Ctx) {
         let w = c.nav;
         let (cx, cy, r) = c.region;
@@ -1032,7 +948,6 @@ impl Cbot {
         self.roof.is_some()
     }
 
-    // ================= state predicates =================
     fn wants(&mut self, s: St, c: &Ctx) -> bool {
         match s {
             St::Escape => self.zone_urgent(c),
@@ -1074,11 +989,9 @@ impl Cbot {
         }
     }
 
-    /// TACTICS #5: enough mechs seen lately within fire range, and no attacker close enough to corner us.
     fn want_break(&mut self, c: &Ctx) -> bool {
         let p = &self.p;
         if p.exposed_break_n < 1.5 || self.final_ {
-            // the final's concealed hold already hides us; a crowded last circle would keep BREAK on
             self.break_spot = None;
             return false;
         }
@@ -1094,8 +1007,6 @@ impl Cbot {
         on
     }
 
-    /// The nearest walkable spot inside the zone that the remembered mechs cannot see,
-    /// re-picked at most once a second.
     fn ensure_break_spot(&mut self, c: &Ctx) -> (f64, f64) {
         if let Some(spot) = self.break_spot.filter(|_| c.t < self.break_pick_t) {
             return spot;
@@ -1132,13 +1043,10 @@ impl Cbot {
         spot
     }
 
-    /// Aggro's own rules apply: the strategy is aggro and the free-for-all switch is not holding it back.
     fn aggro(&self) -> bool {
         self.strategy == Strategy::Aggro && !self.passive && !self.final_ && !self.early
     }
 
-    /// Under the final or early free-for-all rules, a mech worth shooting unprovoked:
-    /// low HP, and in the early game also isolated.
     fn worth_it(&self, c: &Ctx, m: &ActorObs) -> bool {
         if !self.finishable(m) {
             return false;
@@ -1150,7 +1058,6 @@ impl Cbot {
                 .any(|(_, o)| o.id != m.id && (o.pos[0] - m.pos[0]).hypot(o.pos[1] - m.pos[1]) < self.p.isolated_r)
     }
 
-    /// In the free-for-all final, a mech worth shooting without being attacked: shown HP under `finish_hp`.
     fn finishable(&self, m: &ActorObs) -> bool {
         m.hp.is_some_and(|hp| hp < self.p.finish_hp)
     }
@@ -1223,7 +1130,6 @@ impl Cbot {
         c.npcs.iter().find(|(d, _)| *d < p.farm_range).copied()
     }
 
-    // ================= state behaviours: (move, boost, jump, look yaw) =================
     fn threat_look(&self, c: &Ctx, fallback: f64) -> f64 {
         if self.threat_recent(c, self.p.face_threat_s) {
             return self.threat.expect("recent").0;
@@ -1288,7 +1194,6 @@ impl Cbot {
                 let (x, y, watch) = self.ensure_spot(c);
                 let d = (x - c.x).hypot(y - c.y);
                 if self.braking(c) {
-                    // GUESS: full speed until 6 m out, then proportional, stopping within 0.5 m
                     let (ux, uy) = unit(x - c.x, y - c.y);
                     let k = if d < 0.5 { 0.0 } else { (d / 6.0).min(1.0) };
                     return ((ux * k, uy * k), false, false, self.threat_look(c, self.watch_yaw(c, watch)));
@@ -1407,7 +1312,6 @@ impl Cbot {
         let near_wall = (ex - c.x).hypot(ey - c.y) < 9.0;
         let to_center = (ty - c.y).atan2(tx - c.x);
         if airborne && c.z > c.ground + 1.0 {
-            // in the climb: jet until the feet clear the roof, then move over it
             let mv = unit(tx - c.x, ty - c.y);
             let clear = c.z > top + 0.4;
             if !clear && c.me.energy < 2.0 && !self.climb_marked {
@@ -1437,7 +1341,6 @@ impl Cbot {
         }
     }
 
-    // ================= gunnery =================
     fn pick_target<'a>(&self, c: &Ctx<'a>) -> Option<(f64, &'a ActorObs, [f64; 3])> {
         let p = &self.p;
         if self.recovering {
@@ -1507,7 +1410,6 @@ impl Cbot {
         (aim, fire)
     }
 
-    /// Torso aim and triggers, plus the id the gun was on target at and the id aimed at.
     fn aim_and_fire(&self, c: &Ctx, look: f64) -> ([f64; 2], [bool; 2], Option<u32>, Option<u32>) {
         let p = &self.p;
         let (mut on_id, mut target_id) = (None, None);
@@ -1620,7 +1522,6 @@ impl Cbot {
         sol
     }
 
-    // ================= items =================
     fn items(&self, c: &Ctx, act: &mut Action) {
         if let Some(offer) = c.obs.offer.as_ref().filter(|o| !o.choices.is_empty()) {
             let rank = |id: &str| UPGRADE_PREF.iter().position(|u| *u == id).unwrap_or(99);
@@ -1650,7 +1551,6 @@ impl Cbot {
     }
 }
 
-/// `round(v / 20) * 20`, Python's rounding.
 fn snap20(v: f64) -> f64 {
     (pround(v / 20.0) * 20) as f64
 }
@@ -1673,8 +1573,6 @@ fn wanted_weapon(kind: WeaponKind, me: &SelfObs) -> bool {
     }
 }
 
-/// The spot of lowest score plus `w` per watcher that can see it, among the
-/// [`CONCEAL_TESTS`] best by score alone (ties keep the earlier candidate).
 fn concealed_best(c: &Ctx, mut cands: Vec<(f64, f64, f64)>, watchers: &[[f64; 3]], w: f64) -> Option<(f64, f64)> {
     if watchers.is_empty() {
         return None;
@@ -1693,7 +1591,6 @@ fn concealed_best(c: &Ctx, mut cands: Vec<(f64, f64, f64)>, watchers: &[[f64; 3]
     best
 }
 
-/// The best of 16 compass headings whose first `length` meters are walkable, or (0, 0).
 fn best_heading(c: &Ctx, score: impl Fn(f64, f64) -> f64, length: f64) -> (f64, f64) {
     let n = 16;
     let (mut best, mut bs) = ((0.0, 0.0), -1e18);
@@ -1712,7 +1609,6 @@ fn best_heading(c: &Ctx, score: impl Fn(f64, f64) -> f64, length: f64) -> (f64, 
     best
 }
 
-/// Where a mortar shell lands, integrated at 50 ms: `(x, y, seconds)`.
 fn shell_landing(nav: &NavMap, pos: [f64; 3], vel: [f64; 3], g: f64) -> Option<(f64, f64, f64)> {
     let [mut x, mut y, mut z] = pos;
     let [vx, vy, mut vz] = vel;

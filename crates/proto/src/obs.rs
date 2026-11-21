@@ -1,4 +1,3 @@
-//! `obs`: what one mech perceives at a decision.
 
 use crate::{GunStats, LaserStats, LightningStats, MechStats, MortarStats, Vec2, Vec3, WeaponKind};
 use serde::{Deserialize, Serialize};
@@ -10,14 +9,11 @@ fn is_false(b: &bool) -> bool {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Obs {
-    /// Sim tick (20 per second). Echo it in the action.
     pub tick: u32,
     pub t: f64,
-    /// Mechs still alive, NPCs not counted.
     pub alive: u32,
     #[serde(rename = "self")]
     pub me: SelfObs,
-    /// Visible mechs and NPC drones.
     pub mechs: Vec<ActorObs>,
     pub projectiles: Vec<ProjectileObs>,
     pub crates: Vec<ItemObs>,
@@ -35,10 +31,8 @@ pub struct Obs {
 #[serde(default)]
 pub struct SelfObs {
     pub id: u32,
-    /// Feet, bottom center.
     pub pos: Vec3,
     pub vel: Vec3,
-    /// Actual torso `[yaw, pitch]`. Shots leave along this.
     pub aim: Vec2,
     pub hp: f64,
     pub max_hp: f64,
@@ -52,7 +46,6 @@ pub struct SelfObs {
     pub stats: MechStats,
 }
 
-/// A held weapon. `stats` are that weapon's numbers after the holder's upgrades.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum WeaponObs {
@@ -61,7 +54,6 @@ pub enum WeaponObs {
         stats: GunStats,
         #[serde(default)]
         ammo: f64,
-        /// Seconds of reload left, 0 when not reloading.
         #[serde(default)]
         reload: f64,
     },
@@ -71,7 +63,6 @@ pub enum WeaponObs {
     },
     Laser {
         cooldown: f64,
-        /// Seconds charged so far, 0 when not charging.
         #[serde(default)]
         charge: f64,
         stats: LaserStats,
@@ -92,7 +83,6 @@ impl WeaponObs {
         }
     }
 
-    /// Seconds until it can fire again.
     pub fn cooldown(&self) -> f64 {
         match self {
             Self::Gun { cooldown, .. } | Self::Mortar { cooldown, .. } | Self::Laser { cooldown, .. } | Self::Lightning { cooldown, .. } => *cooldown,
@@ -107,7 +97,6 @@ pub enum ActorKind {
     Npc,
 }
 
-/// Another mech or an NPC drone in view. NPCs carry no `cubes`, `weapons`, or `charging`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ActorObs {
     pub id: u32,
@@ -115,17 +104,14 @@ pub struct ActorObs {
     pub pos: Vec3,
     pub vel: Vec3,
     pub aim: Vec2,
-    /// Present while `vision.show_enemy_hp` is true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hp: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_hp: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cubes: Option<u32>,
-    /// Weapons held, empty slots omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weapons: Option<Vec<WeaponKind>>,
-    /// Its laser is charging and will fire along `aim`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub charging: Option<bool>,
 }
@@ -156,7 +142,6 @@ pub struct ProjectileObs {
     pub vel: Vec3,
 }
 
-/// A crate (with `hp`) or a power cube (without).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ItemObs {
     pub id: u32,
@@ -200,7 +185,6 @@ pub enum SoundDist {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SoundObs {
     pub kind: SoundKind,
-    /// World-frame yaw toward the source, with Gaussian error.
     pub bearing: f64,
     pub dist: SoundDist,
     pub age: f64,
@@ -213,7 +197,6 @@ pub enum BeamKind {
     Lightning,
 }
 
-/// An instant shot by another mech. `path` starts at its muzzle.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BeamObs {
     pub by: u32,
@@ -223,7 +206,6 @@ pub struct BeamObs {
 }
 
 open_enum!(
-    /// What dealt damage: a weapon kind, `npc`, or `zone`.
     DamageKind {
         Gun = "gun",
         Mortar = "mortar",
@@ -263,21 +245,18 @@ pub enum TakeFailReason {
     Busy,
 }
 
-/// Something that happened to this mech since its last observation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GameEvent {
     Damaged {
         amount: f64,
         weapon: DamageKind,
-        /// World-frame yaw toward the source, null for the zone.
         bearing: Option<f64>,
         by: Option<u32>,
         #[serde(default, skip_serializing_if = "is_false")]
         rear: bool,
     },
     Hit {
-        /// A mech, NPC, or crate id.
         target: u32,
         amount: f64,
         weapon: DamageKind,
@@ -317,7 +296,6 @@ pub enum GameEvent {
         id: u32,
         reason: TakeFailReason,
     },
-    /// An event type added to the protocol after this build.
     #[serde(other)]
     Unknown,
 }
@@ -327,15 +305,12 @@ pub struct DropObs {
     pub id: u32,
     pub pos: Vec3,
     pub radius: f64,
-    /// Seconds until it is on the ground, 0 when capturable.
     pub lands_in: f64,
     pub capture_s: f64,
-    /// Seconds the holder has banked of `capture_s`.
     pub progress: f64,
     pub holder: Option<u32>,
 }
 
-/// The current circle, the circle it shrinks to, and the shrink window.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ZoneObs {
@@ -352,7 +327,6 @@ pub struct ZoneObs {
 pub struct Offer {
     pub id: u32,
     pub choices: Vec<OfferChoice>,
-    /// Match time at which choice 0 is applied.
     pub expires: f64,
 }
 

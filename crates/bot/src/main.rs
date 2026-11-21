@@ -1,8 +1,3 @@
-//! The submitted bot: JSON lines on stdin, JSON lines on stdout, logs on stderr.
-//!
-//! A crashed or silent bot idles for the rest of the match, so nothing here
-//! may stop the loop: a line that does not parse, a map that does not load,
-//! and a panic in the policy all still get an answer with the right tick.
 
 use policy::{Params, Policy};
 use proto::{Action, Hello, Obs, Ready};
@@ -10,10 +5,8 @@ use serde::Deserialize;
 use std::io::{Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-/// Larger than the pipe buffer, so one read takes every observation that is queued.
 const READ_CHUNK: usize = 1 << 20;
 
-/// Just enough of a server line to route it.
 #[derive(Deserialize)]
 struct Peek {
     #[serde(rename = "type", default)]
@@ -32,7 +25,6 @@ fn send<T: serde::Serialize>(out: &mut impl Write, message: &T) {
 
 struct Bot {
     policy: Box<dyn Policy>,
-    /// The last action sent, to coast on when a decision fails.
     last: Action,
 }
 
@@ -70,11 +62,8 @@ impl Bot {
     }
 }
 
-/// The policy the bot plays when `MECH_POLICY` is unset or unknown.
 const DEFAULT_POLICY: &str = "aggro";
 
-/// Params from the file named by `MECH_PARAMS`, else the defaults. A file that
-/// cannot be read or parsed is logged and ignored: the bot always plays.
 fn params() -> Params {
     let Some(path) = std::env::var_os("MECH_PARAMS").filter(|p| !p.is_empty()) else {
         return Params::default();
