@@ -1,17 +1,13 @@
 
 mod cbot;
 mod example;
-mod house;
 pub mod nav;
 mod params;
 pub mod pyrand;
-pub mod squad;
 
 pub use cbot::{Cbot, Strategy};
 pub use example::Example;
-pub use house::{make_squad, House, SquadHandle};
 pub use params::{Params, ParamsF64};
-pub use squad::{Squad, SquadParams, Tier};
 
 use proto::{Action, Hello, Obs};
 
@@ -46,25 +42,16 @@ pub const NAMES: &[&str] = &[
     "roof",
     "example",
     "idle",
-    "house",
-    "house-easy",
-    "house-mid",
-    "house-expert",
 ];
 
 pub fn make(name: &str, params: &Params) -> Option<Box<dyn Policy>> {
     match name {
         "example" => Some(Box::new(Example::new(params.clone()))),
         "idle" => Some(Box::new(Idle)),
-        _ if is_house(name) => make_squad(&[name], params)?.0.pop(),
         _ => Strategy::parse(name).map(|s| Box::new(Cbot::new(s, params.clone())) as Box<dyn Policy>),
     }
 }
 
-pub fn is_house(name: &str) -> bool {
-    house::parse_name(name).is_some()
-}
-
 pub fn is_known(name: &str) -> bool {
-    NAMES.contains(&name) || is_house(name)
+    NAMES.contains(&name)
 }
