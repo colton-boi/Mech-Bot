@@ -37,13 +37,14 @@ PARAMS = {
     "lock_bonus": 30.0, "lock_memory_s": 2.0, "attacker_bonus": 15.0, "weak_w": 50.0, "strafe_s": (1.0, 2.4), "aim_tol_min": 0.012, "aim_at_me_rad": 0.18,
     "max_los_checks": 5,
     # loot and drops
-    "loot_detour": 35.0, "cube_detour": 30.0, "quiet_s": 12.0, "loot_enemy_clear": 80.0,
+    "loot_detour": 35.0, "cube_detour": 30.0, "weapon_detour_empty": 80.0, "fight_loot_r": 18.0,
+    "fight_weapon_r": 40.0, "fight_weapon_min_target": 60.0, "fight_loot_give_up_s": 2.5, "quiet_s": 12.0, "loot_enemy_clear": 80.0,
     "drop_max_dist": 170.0, "drop_enemy_clear": 60.0,
     "farm_range": 75.0, "farm_min_hp": 0.75, "farm_until_t": 200.0,
     "weapon_pref": ["lightning", "laser", "mortar"],
-    "upgrade_pref": ["plating", "armor", "nanites", "gyros", "gun_rate", "gun_damage", "lightning_efficiency",
-                     "laser_damage", "laser_charge", "mortar_reload", "lightning_range", "lightning_chain",
-                     "sensors", "servos", "gun_velocity", "gun_mag", "reactor", "capacitor", "jets",
+    "upgrade_pref": ["gun_mag", "plating", "armor", "gun_damage", "gun_rate", "lightning_efficiency",
+                     "laser_damage", "laser_charge", "nanites", "gyros", "lightning_range", "lightning_chain",
+                     "mortar_reload", "sensors", "servos", "gun_velocity", "reactor", "capacitor", "jets",
                      "mortar_splash", "mortar_velocity", "laser_pierce"],
     # reflexes
     "shell_margin": 5.0, "laser_dodge_rad": 0.12, "stuck_speed": 1.5, "stuck_decisions": 6, "stuck_jet_s": 0.9,
@@ -156,6 +157,8 @@ class Bot:
         self.lock = None            # (id, last seen mech dict, t)
         self.lock_tick = None
         self.lock_pick = None
+        self.fight_loot = None      # (item id, start t, give-up s)
+        self.loot_skip = {}         # item id -> t until which it is ignored
         self.handlers = {s: getattr(self, "do_" + s.lower()) for s in self.profile["states"]}
         self.wants = {s: getattr(self, "want_" + s.lower()) for s in self.profile["states"]}
         self.timings = []
@@ -213,6 +216,8 @@ class Bot:
                     self.threat = (b, c.t, by)
             elif et == "hit":
                 self.last_dealt_t = c.t
+            elif et in ("pickup", "upgrade", "took", "kill"):
+                log(f"[cbot] t={c.t:.1f} {et} {ev.get('kind', ev.get('cubes', ev.get('id', ev.get('target'))))}")
             elif et == "take_failed":
                 log(f"[cbot] take failed {ev.get('reason')}")
         for s in c.obs.get("sounds", []):
@@ -553,13 +558,43 @@ class Bot:
             if not self.wanted_weapon(p["kind"], c):
                 continue
             d = math.hypot(p["pos"][0] - c.x, p["pos"][1] - c.y)
-            if d < P["loot_detour"] and abs(p["pos"][2] - c.z) < 4 and d < bd:
+            r = P["weapon_detour_empty"] if self.slot1_empty(c) and p["kind"] != "mortar" else P["loot_detour"]
+            if d < r and abs(p["pos"][2] - c.z) < 4 and d < bd:
                 best, bd = p["pos"], d
         for cu in c.obs.get("cubes", []):
             d = math.hypot(cu["pos"][0] - c.x, cu["pos"][1] - c.y)
             if d < P["cube_detour"] and abs(cu["pos"][2] - c.z) < 4 and d < bd:
                 best, bd = cu["pos"], d
         return best
+
+    def slot1_empty(self, c):
+        w = c.me["weapons"]
+        return len(w) < 2 or w[1] is None
+
+    def fight_loot_target(self, c, d_tgt):
+        """Loot worth grabbing mid-fight: cubes at our feet (kill drops), or a first real weapon nearer than the target."""
+        P = PARAMS
+        best, bd = None, 1e18
+
+        def ok(it):
+            x, y, z = it["pos"]
+            return abs(z - c.z) < 4 and self.loot_skip.get(it["id"], -1.0) < c.t and c.dist_region(x, y) <= 0
+
+        for cu in c.obs.get("cubes", []):
+            d = math.hypot(cu["pos"][0] - c.x, cu["pos"][1] - c.y)
+            if d < P["fight_loot_r"] and d < bd and ok(cu):
+                best, bd = cu, d
+        empty = self.slot1_empty(c)
+        for p in c.obs.get("pickups", []):
+            if p["kind"] == "mortar" or not self.wanted_weapon(p["kind"], c):
+                continue
+            d = math.hypot(p["pos"][0] - c.x, p["pos"][1] - c.y)
+            r = P["fight_loot_r"]
+            if empty and d_tgt > P["fight_weapon_min_target"]:
+                r = P["fight_weapon_r"]
+            if d < r and d < bd and ok(p):
+                best, bd = p, d
+        return best, bd
 
     def want_loot(self, c):
         return self.loot_target(c) is not None
@@ -646,6 +681,24 @@ class Bot:
             radial = -1.0
         elif d > hi:
             radial = 1.0 if self.strategy == "aggro" else 0.0
+        if self.strategy == "aggro":
+            it, ld = self.fight_loot_target(c, d)
+            if it is not None and self.fight_loot and self.fight_loot[0] == it["id"] \
+                    and c.t - self.fight_loot[1] > self.fight_loot[2]:
+                log(f"[cbot] t={c.t:.1f} fight loot give up {ld:.0f} m")
+                self.loot_skip[it["id"]] = c.t + 20.0
+                self.fight_loot = None
+                it, ld = None, 0.0
+            if it is not None:
+                if not self.fight_loot or self.fight_loot[0] != it["id"]:
+                    log(f"[cbot] t={c.t:.1f} fight loot {ld:.0f} m, target {d:.0f} m")
+                    self.fight_loot = (it["id"], c.t, P["fight_loot_give_up_s"] + ld / 12.0)
+                x, y = it["pos"][0], it["pos"][1]
+                lx, ly = unit(x - c.x, y - c.y)
+                # local heading only: a flow field per item would churn the shared path search mid-fight
+                mv = (lx, ly) if ld < 5 else self.best_heading(c, lambda dx, dy: dx * lx + dy * ly, length=min(10.0, ld))
+                return mv, ld > 6 and c.me["energy"] > P["aggro_boost_energy"], False, math.atan2(by, bx)
+            self.fight_loot = None
         if self.strategy == "aggro" and d > hi:
             boost = c.me["energy"] > P["aggro_boost_energy"]
             if d < P["aggro_direct_dist"] and c.z - c.ground < 3.0 and self.world.clear_ray(c.x, c.y, bx, by, d - hi * 0.5):
