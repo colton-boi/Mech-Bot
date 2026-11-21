@@ -28,7 +28,8 @@ PARAMS = {
     # zone
     "zone_margin": 30.0, "zone_margin_frac": 0.4, "zone_slack_s": 10.0,
     # health
-    "retreat_frac": 0.4, "resume_frac": 0.85, "retreat_gives_up_dist": 25.0,
+    "retreat_frac": 0.4, "resume_frac": 0.85, "retreat_gives_up_dist": 25.0, "retreat_memory_s": 20.0,
+    "retreat_quiet_fire_s": 2.0,
     "threat_memory_s": 6.0, "face_threat_s": 10.0, "alert_s": 3.0,
     # engagement
     "engage_range": 130.0, "fire_range": 210.0, "fight_min_dist": 40.0, "fight_max_dist": 110.0,
@@ -143,7 +144,7 @@ class Bot:
         self.spot_key = None
         self.roof = None
         self.roof_fail = {}
-        self.climb_tries = 0
+        self.climb_marked = False
         self.strafe_sign = 1
         self.strafe_until = 0.0
         self.slow_count = 0
@@ -446,7 +447,8 @@ class Bot:
 
     def want_retreat(self, c):
         P = PARAMS
-        if not self.threat_recent(c, P["threat_memory_s"]):
+        window = P["retreat_memory_s"] if self.state == "RETREAT" else P["threat_memory_s"]
+        if not self.threat_recent(c, window):
             return False
         att = self.attacker(c)
         if att and att[0] < P["retreat_gives_up_dist"]:
@@ -608,7 +610,7 @@ class Bot:
         elif d > hi:
             radial = 1.0 if self.strategy == "aggro" else 0.0
         if self.strategy == "aggro" and d > hi:
-            mv = self.go(c, m["pos"][0], m["pos"][1], hi * 0.8)
+            mv = self.go(c, round(m["pos"][0] / 20) * 20, round(m["pos"][1] / 20) * 20, hi * 0.8)
             return mv, c.me["energy"] > 40, False, math.atan2(by, bx)
         gx, gy = px + radial * bx, py + radial * by
         mv = self.best_heading(c, lambda dx, dy: dx * gx + dy * gy - self.region_penalty(c, dx, dy), length=8.0)
@@ -654,7 +656,7 @@ class Bot:
     def do_hunt(self, c):
         if c.enemies:
             m = c.enemies[0][1]
-            mv = self.go(c, m["pos"][0], m["pos"][1], 20.0)
+            mv = self.go(c, round(m["pos"][0] / 20) * 20, round(m["pos"][1] / 20) * 20, 20.0)
             return mv, c.me["energy"] > 60, False, math.atan2(m["pos"][1] - c.y, m["pos"][0] - c.x)
         if self.alert and c.t - self.alert[1] < 8:
             b = self.alert[0]
@@ -674,9 +676,13 @@ class Bot:
             # in the climb: jet until the feet clear the roof, then move over it
             mv = unit(tx - c.x, ty - c.y)
             clear = c.z > rf["top"] + 0.4
-            if not clear and c.me["energy"] < 2:
+            if not clear and c.me["energy"] < 2 and not self.climb_marked:
+                self.climb_marked = True
                 self.climb_failed(c)
             return mv if clear or near_wall else unit(ex - c.x, ey - c.y), not clear, False, math.atan2(ty - c.y, tx - c.x)
+        self.climb_marked = False
+        if self.roof is None:
+            return (0.0, 0.0), False, False, self.threat_look(c, c.me["aim"][0])
         if d_ap > 4.0 and not near_wall:
             mv = self.go(c, qx, qy, 2.0)
             return mv, False, False, self.threat_look(c, math.atan2(mv[1], mv[0]) if mv != (0.0, 0.0) else 0.0)
@@ -708,8 +714,8 @@ class Bot:
         attacked = self.threat_recent(c, P["threat_memory_s"])
         if policy == "attacked" and not attacked:
             return None
-        if self.state == "RETREAT":
-            return None  # dealing damage resets the regen clock
+        if self.state == "RETREAT" and c.t - self.last_damage_t > P["retreat_quiet_fire_s"]:
+            return None  # once the hits stop, dealing damage would only reset the regen clock
         att = self.attacker(c)
         cands = []
         if att:
