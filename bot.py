@@ -34,7 +34,7 @@ PARAMS = {
                                    "jets", "laser_pierce"]},
     },
     # squad: engagement triggers
-    "sq_cap": 240.0, "sq_near": 60.0, "sq_hit_s": 6.0, "sq_close_v": 3.0, "sq_close_d": 180.0,
+    "sq_cap": 240.0, "sq_gun_r": 80.0, "sq_near": 60.0, "sq_hit_s": 6.0, "sq_close_v": 3.0, "sq_close_d": 180.0,
     "sq_weak_frac": 0.40, "sq_weak_d": 160.0, "sq_aim_rad": 0.22, "sq_aim_d": 190.0, "sq_stick_s": 2.0,
     # squad: target score
     "sq_hp_w": 0.2, "sq_low_frac": 0.30, "sq_low_bonus": 100.0, "sq_stick_bonus": 120.0, "sq_hit_bonus": 40.0,
@@ -44,7 +44,7 @@ PARAMS = {
     "sq_r_vs_mortar": 80.0, "sq_r_npc": 58.0, "sq_r_finish": 14.0, "sq_finish_tgt": 0.38, "sq_finish_me": 0.42,
     "sq_finish_view": 2,
     # squad: spot scoring
-    "laser_gun_lead": 1, "sq_ring": 6.0, "sq_w_range": 1.1, "sq_w_exposed": 30.0, "sq_exposed_d": 170.0, "sq_w_los": 45.0,
+    "sq_ring": 6.0, "sq_w_range": 1.1, "sq_w_exposed": 30.0, "sq_exposed_d": 170.0, "sq_w_los": 45.0,
     "sq_w_cube": 1.5, "sq_cube_pull_d": 40.0, "sq_w_strafe": 4.0, "sq_strafe_s": (0.3, 1.0), "sq_others": 3,
     # squad: breaking off
     "sq_lose_hold_s": 1.5, "sq_lose_d": 160.0, "sq_lose2_hp": 0.55, "sq_lose3_hp": 0.80, "sq_lose_hp": 0.35,
@@ -1458,7 +1458,9 @@ class Bot:
             on = self.aimed(c, aim_yaw, aim_pitch, tol)
             if gun is not None:
                 gw = weapons[gun]
-                if on and gw.get("ammo", 1) > 0 and gw.get("reload", 0) <= 0 and d < gw["stats"].get("range", 230):
+                # squad: no long gun shots at mechs; they wake up bystanders and cost real practice
+                gun_ok = self.strategy != "squad" or m.get("kind") != "mech" or d <= P["sq_gun_r"]
+                if gun_ok and on and gw.get("ammo", 1) > 0 and gw.get("reload", 0) <= 0 and d < gw["stats"].get("range", 230):
                     fire[gun] = True
             lt = kinds.get("lightning")
             if lt is not None:
@@ -1480,13 +1482,10 @@ class Bot:
                 if self.strategy == "squad" and not charged and self.sq_partial_kills(c, lw, m):
                     charged = True
                 if lw.get("charge", 0) > 0 or lw["cooldown"] <= 0:
-                    if charged or not P["laser_gun_lead"]:
-                        aim_yaw, aim_pitch = direct_yaw, direct_pitch
-                        fire[laser_slot] = not (charged and self.aimed(c, direct_yaw, direct_pitch, tol))
-                        if fire[laser_slot] and gun is not None:
-                            fire[gun] = fire[gun] and self.aimed(c, direct_yaw, direct_pitch, tol)
-                    else:
-                        fire[laser_slot] = True   # charging ignores aim: keep the gun on its lead point meanwhile
+                    aim_yaw, aim_pitch = direct_yaw, direct_pitch
+                    fire[laser_slot] = not (charged and self.aimed(c, direct_yaw, direct_pitch, tol))
+                    if fire[laser_slot] and gun is not None:
+                        fire[gun] = fire[gun] and self.aimed(c, direct_yaw, direct_pitch, tol)
         elif laser_slot is not None and weapons[laser_slot].get("charge", 0) > 0:
             fire[laser_slot] = False
         else:
