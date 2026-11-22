@@ -17,17 +17,12 @@ impl PyRandom {
         if seed >> 32 != 0 {
             key.push((seed >> 32) as u32);
         }
-        let mut r = PyRandom {
-            mt: [0; N],
-            index: N,
-        };
+        let mut r = PyRandom { mt: [0; N], index: N };
         r.init_genrand(19_650_218);
         let (mut i, mut j) = (1usize, 0usize);
         for _ in 0..N.max(key.len()) {
             let prev = r.mt[i - 1] ^ (r.mt[i - 1] >> 30);
-            r.mt[i] = (r.mt[i] ^ prev.wrapping_mul(1_664_525))
-                .wrapping_add(key[j])
-                .wrapping_add(j as u32);
+            r.mt[i] = (r.mt[i] ^ prev.wrapping_mul(1_664_525)).wrapping_add(key[j]).wrapping_add(j as u32);
             i += 1;
             j += 1;
             if i >= N {

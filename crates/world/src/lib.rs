@@ -45,10 +45,7 @@ pub struct Bounds {
 impl Bounds {
     /// True when `(x, y)` is at least `margin` meters inside the map edge.
     pub fn contains(&self, x: f64, y: f64, margin: f64) -> bool {
-        x >= self.min_x + margin
-            && x <= self.max_x - margin
-            && y >= self.min_y + margin
-            && y <= self.max_y - margin
+        x >= self.min_x + margin && x <= self.max_x - margin && y >= self.min_y + margin && y <= self.max_y - margin
     }
 }
 
@@ -79,10 +76,7 @@ impl World {
             terrain: Terrain::flat(-half, -half, 2.0 * half, 0.0),
             prisms: Vec::new(),
             trees: Vec::new(),
-            canopy: CanopyRules {
-                density: 0.35,
-                block_t: 0.25,
-            },
+            canopy: CanopyRules { density: 0.35, block_t: 0.25 },
             grid: OnceLock::new(),
         }
     }
@@ -91,10 +85,7 @@ impl World {
     /// `on_hello`, so sixteen simulated mechs share one copy.
     pub fn shared(dir: &Path) -> Result<Arc<World>, WorldError> {
         static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<World>>>> = OnceLock::new();
-        let mut cache = CACHE
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut cache = CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
         if let Some(world) = cache.get(dir) {
             return Ok(world.clone());
         }

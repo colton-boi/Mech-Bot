@@ -354,12 +354,7 @@ pub struct ZoneCfg {
 
 impl Default for ZoneCfg {
     fn default() -> Self {
-        let phase = |hold_s, shrink_s, radius, dps| ZonePhase {
-            hold_s,
-            shrink_s,
-            radius,
-            dps,
-        };
+        let phase = |hold_s, shrink_s, radius, dps| ZonePhase { hold_s, shrink_s, radius, dps };
         Self {
             start_center: [41.3, -72.8],
             start_radius: 560.0,
@@ -506,12 +501,7 @@ fn default_upgrades() -> Vec<UpgradeDef> {
         mul: None,
         add: Some(v),
     };
-    let up = |id: &str,
-              name: &str,
-              desc: &str,
-              requires: Option<WeaponKind>,
-              max: u32,
-              effects: Vec<Effect>| UpgradeDef {
+    let up = |id: &str, name: &str, desc: &str, requires: Option<WeaponKind>, max: u32, effects: Vec<Effect>| UpgradeDef {
         id: id.to_owned(),
         name: name.to_owned(),
         desc: desc.to_owned(),
@@ -520,22 +510,8 @@ fn default_upgrades() -> Vec<UpgradeDef> {
         effects,
     };
     vec![
-        up(
-            "plating",
-            "Composite plating",
-            "+15% max HP",
-            None,
-            3,
-            vec![mul("mech.hp", 1.15)],
-        ),
-        up(
-            "armor",
-            "Reactive armor",
-            "-8% damage taken",
-            None,
-            3,
-            vec![add("mech.armor", 0.08)],
-        ),
+        up("plating", "Composite plating", "+15% max HP", None, 3, vec![mul("mech.hp", 1.15)]),
+        up("armor", "Reactive armor", "-8% damage taken", None, 3, vec![add("mech.armor", 0.08)]),
         up(
             "servos",
             "Leg servos",
@@ -544,22 +520,8 @@ fn default_upgrades() -> Vec<UpgradeDef> {
             3,
             vec![mul("mech.walk_speed", 1.08), mul("mech.boost_speed", 1.08)],
         ),
-        up(
-            "capacitor",
-            "Capacitor bank",
-            "+30 max energy",
-            None,
-            3,
-            vec![add("mech.energy", 30.0)],
-        ),
-        up(
-            "reactor",
-            "Reactor tune",
-            "+30% energy regen",
-            None,
-            3,
-            vec![mul("mech.energy_regen", 1.3)],
-        ),
+        up("capacitor", "Capacitor bank", "+30 max energy", None, 3, vec![add("mech.energy", 30.0)]),
+        up("reactor", "Reactor tune", "+30% energy regen", None, 3, vec![mul("mech.energy_regen", 1.3)]),
         up(
             "jets",
             "Efficient jets",
@@ -590,11 +552,7 @@ fn default_upgrades() -> Vec<UpgradeDef> {
             "+15 m proximity sensors, +25 m vision, halves sound bearing error",
             None,
             2,
-            vec![
-                add("mech.near_range_bonus", 15.0),
-                add("mech.vision_bonus", 25.0),
-                mul("mech.hearing", 0.5),
-            ],
+            vec![add("mech.near_range_bonus", 15.0), add("mech.vision_bonus", 25.0), mul("mech.hearing", 0.5)],
         ),
         up(
             "gun_damage",
@@ -618,10 +576,7 @@ fn default_upgrades() -> Vec<UpgradeDef> {
             "+25% arm gun projectile speed",
             Some(Gun),
             2,
-            vec![
-                mul("weapons.gun.speed", 1.25),
-                mul("weapons.gun.range", 1.15),
-            ],
+            vec![mul("weapons.gun.speed", 1.25), mul("weapons.gun.range", 1.15)],
         ),
         up(
             "gun_mag",
@@ -693,10 +648,7 @@ fn default_upgrades() -> Vec<UpgradeDef> {
             "+20% lightning range and cone",
             Some(Lightning),
             2,
-            vec![
-                mul("weapons.lightning.range", 1.2),
-                mul("weapons.lightning.cone_deg", 1.2),
-            ],
+            vec![mul("weapons.lightning.range", 1.2), mul("weapons.lightning.cone_deg", 1.2)],
         ),
         up(
             "lightning_efficiency",
@@ -704,10 +656,7 @@ fn default_upgrades() -> Vec<UpgradeDef> {
             "-35% lightning energy cost, +10% damage",
             Some(Lightning),
             2,
-            vec![
-                mul("weapons.lightning.energy", 0.65),
-                mul("weapons.lightning.damage", 1.1),
-            ],
+            vec![mul("weapons.lightning.energy", 0.65), mul("weapons.lightning.damage", 1.1)],
         ),
     ]
 }

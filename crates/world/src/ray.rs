@@ -34,11 +34,7 @@ pub struct RayHit {
 }
 
 fn lerp(a: Vec3, b: Vec3, t: f64) -> Vec3 {
-    [
-        a[0] + (b[0] - a[0]) * t,
-        a[1] + (b[1] - a[1]) * t,
-        a[2] + (b[2] - a[2]) * t,
-    ]
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
 }
 
 /// Fraction along `a -> b` at which the segment first touches `prism`, if it does.
@@ -78,11 +74,7 @@ fn prism_crossings(prism: &Prism, a: Vec3, b: Vec3, mut found: impl FnMut(f64) -
     // The part of the segment inside the prism's box. Every contact lies in it,
     // so it is all the edge walk needs to look near.
     let (mut t0, mut t1) = (0.0f64, 1.0f64);
-    for (p, dp, lo, hi) in [
-        (a[0], d[0], min_x, max_x),
-        (a[1], d[1], min_y, max_y),
-        (a[2], d[2], prism.base, prism.top),
-    ] {
+    for (p, dp, lo, hi) in [(a[0], d[0], min_x, max_x), (a[1], d[1], min_y, max_y), (a[2], d[2], prism.base, prism.top)] {
         if dp == 0.0 {
             continue;
         }
@@ -119,10 +111,7 @@ fn prism_crossings(prism: &Prism, a: Vec3, b: Vec3, mut found: impl FnMut(f64) -
     if d[2] != 0.0 {
         for cap in [prism.top, prism.base] {
             let t = (cap - a[2]) / d[2];
-            if (0.0..=1.0).contains(&t)
-                && prism.contains_xy(a[0] + d[0] * t, a[1] + d[1] * t)
-                && !found(t)
-            {
+            if (0.0..=1.0).contains(&t) && prism.contains_xy(a[0] + d[0] * t, a[1] + d[1] * t) && !found(t) {
                 return;
             }
         }
@@ -152,10 +141,7 @@ impl World {
             // A run of samples that all pass above the highest ground under them
             // cannot hit, so the march finds the same first sample without them.
             let run_end = (k + MARCH_RUN - 1).min(steps);
-            let (p, q) = (
-                lerp(a, b, k as f64 / steps as f64),
-                lerp(a, b, run_end as f64 / steps as f64),
-            );
+            let (p, q) = (lerp(a, b, k as f64 / steps as f64), lerp(a, b, run_end as f64 / steps as f64));
             if p[2].min(q[2]) > self.terrain.max_in(p[0], p[1], q[0], q[1]) + 1e-6 {
                 above = run_end as f64 / steps as f64;
                 k = run_end + 1;
@@ -236,10 +222,7 @@ impl World {
     pub fn los_hinted(&self, a: Vec3, b: Vec3, hint: &mut u32) -> bool {
         let blocked = match *hint {
             TERRAIN_HINT => self.terrain_entry(a, b).is_some(),
-            i => self
-                .prisms
-                .get(i as usize)
-                .is_some_and(|p| prism_hit(p, a, b)),
+            i => self.prisms.get(i as usize).is_some_and(|p| prism_hit(p, a, b)),
         };
         if blocked {
             return false;
@@ -248,8 +231,7 @@ impl World {
             Some(grid) => grid.find_prism_on(a, b, |i| prism_hit(&self.prisms[i], a, b)),
             None => match self.raycast_reference(a, b) {
                 Some(RayHit {
-                    surface: Surface::Prism(i),
-                    ..
+                    surface: Surface::Prism(i), ..
                 }) => Some(i),
                 Some(_) => {
                     *hint = TERRAIN_HINT;

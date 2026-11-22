@@ -19,14 +19,7 @@ pub struct Terrain {
 const TILE: usize = 16;
 
 impl Terrain {
-    pub fn new(
-        min_x: f64,
-        min_y: f64,
-        step: f64,
-        nx: usize,
-        ny: usize,
-        heights: Vec<f32>,
-    ) -> Terrain {
+    pub fn new(min_x: f64, min_y: f64, step: f64, nx: usize, ny: usize, heights: Vec<f32>) -> Terrain {
         assert!(
             nx >= 2 && ny >= 2 && heights.len() == nx * ny,
             "terrain grid is {nx} x {ny} with {} heights",
@@ -69,10 +62,7 @@ impl Terrain {
     fn cell(&self, x: f64, y: f64) -> (usize, usize) {
         let fx = ((x - self.min_x) / self.step).clamp(0.0, (self.nx - 1) as f64);
         let fy = ((y - self.min_y) / self.step).clamp(0.0, (self.ny - 1) as f64);
-        (
-            (fx as usize).min(self.nx - 2),
-            (fy as usize).min(self.ny - 2),
-        )
+        ((fx as usize).min(self.nx - 2), (fy as usize).min(self.ny - 2))
     }
 
     /// An upper bound on `height` anywhere in the box from `(x0, y0)` to `(x1, y1)`.

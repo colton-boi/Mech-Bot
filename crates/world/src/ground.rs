@@ -16,10 +16,7 @@ impl Prism {
 
     /// True when a disc of radius `r` at `(x, y)` overlaps the footprint by more than a touch.
     pub fn overlaps_disc(&self, x: f64, y: f64, r: f64) -> bool {
-        self.bbox_near(x, y, r)
-            && (self.contains_xy(x, y)
-                || (self.edges_may_be_within(x, y, r)
-                    && self.nearest_edge(x, y).1 < r - CLEAR * 0.5))
+        self.bbox_near(x, y, r) && (self.contains_xy(x, y) || (self.edges_may_be_within(x, y, r) && self.nearest_edge(x, y).1 < r - CLEAR * 0.5))
     }
 
     /// The shortest horizontal shift that takes a disc of radius `r` at
@@ -86,8 +83,7 @@ impl World {
     /// the terrain, or a prism top at or below `z_max` if one is higher.
     pub fn surface_at(&self, x: f64, y: f64, z_max: f64) -> f64 {
         let ground = self.terrain.height(x, y);
-        self.roof_at(x, y, z_max)
-            .map_or(ground, |roof| roof.max(ground))
+        self.roof_at(x, y, z_max).map_or(ground, |roof| roof.max(ground))
     }
 
     /// Height a vertical cylinder of `radius` rests at when coming down from `z_max`:
@@ -108,9 +104,6 @@ impl World {
 
     /// True when the point is under the terrain or inside a prism.
     pub fn solid_at(&self, p: Vec3) -> bool {
-        p[2] < self.terrain.height(p[0], p[1])
-            || self
-                .prisms_at(p[0], p[1])
-                .any(|(_, prism)| prism.contains(p))
+        p[2] < self.terrain.height(p[0], p[1]) || self.prisms_at(p[0], p[1]).any(|(_, prism)| prism.contains(p))
     }
 }

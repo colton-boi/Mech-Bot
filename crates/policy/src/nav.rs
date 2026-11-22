@@ -75,16 +75,9 @@ impl NavMap {
     pub fn shared(dir: &str, dims: MechDims) -> Arc<NavMap> {
         type Cache = Mutex<Vec<(PathBuf, [u64; 3], Arc<NavMap>)>>;
         static CACHE: OnceLock<Cache> = OnceLock::new();
-        let key = [
-            dims.step_up.to_bits(),
-            dims.height.to_bits(),
-            dims.max_slope_deg.to_bits(),
-        ];
+        let key = [dims.step_up.to_bits(), dims.height.to_bits(), dims.max_slope_deg.to_bits()];
         let path = PathBuf::from(dir);
-        let mut cache = CACHE
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut cache = CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, _, nav)) = cache.iter().find(|(p, k, _)| *p == path && *k == key) {
             return nav.clone();
         }
@@ -218,14 +211,11 @@ impl NavMap {
         let i = ((x - self.rx0) / self.rs) as i64;
         let j = ((y - self.ry0) / self.rs) as i64;
         (0..self.rw as i64).contains(&i).then_some(())?;
-        (0..self.rh as i64)
-            .contains(&j)
-            .then(|| (j * self.rw as i64 + i) as usize)
+        (0..self.rh as i64).contains(&j).then(|| (j * self.rw as i64 + i) as usize)
     }
 
     pub fn roof_top(&self, x: f64, y: f64) -> f64 {
-        self.rcell(x, y)
-            .map_or(NONE_TOP, |c| f64::from(self.rtop[c]))
+        self.rcell(x, y).map_or(NONE_TOP, |c| f64::from(self.rtop[c]))
     }
 
     /// True if the segment a->b clears every prism and the terrain, sampled every 1.5 m.
@@ -239,19 +229,11 @@ impl NavMap {
         if n <= 1 {
             return true;
         }
-        let (rw, rh, tnx, tny) = (
-            self.rw as i64,
-            self.rh as i64,
-            self.tnx as i64,
-            self.tny as i64,
-        );
+        let (rw, rh, tnx, tny) = (self.rw as i64, self.rh as i64, self.tnx as i64, self.tny as i64);
         for k in 1..n {
             let f = k as f64 / n as f64;
             let (x, y, z) = (a[0] + dx * f, a[1] + dy * f, a[2] + dz * f);
-            let (i, j) = (
-                ((x - self.rx0) / self.rs) as i64,
-                ((y - self.ry0) / self.rs) as i64,
-            );
+            let (i, j) = (((x - self.rx0) / self.rs) as i64, ((y - self.ry0) / self.rs) as i64);
             if (0..rw).contains(&i) && (0..rh).contains(&j) {
                 let c = (j * rw + i) as usize;
                 let top = f64::from(self.rtop[c]);
@@ -261,10 +243,7 @@ impl NavMap {
             }
             let ti = ((x - self.tx0) / self.tstep + 0.5) as i64;
             let tj = ((y - self.ty0) / self.tstep + 0.5) as i64;
-            if (0..tnx).contains(&ti)
-                && (0..tny).contains(&tj)
-                && z < f64::from(self.h[(tj * tnx + ti) as usize]) - 0.3
-            {
+            if (0..tnx).contains(&ti) && (0..tny).contains(&tj) && z < f64::from(self.h[(tj * tnx + ti) as usize]) - 0.3 {
                 return false;
             }
         }
@@ -435,11 +414,7 @@ impl NavMap {
     // ---------- roofs ----------
     fn roof_candidates(&self, world: &World) -> Vec<Roof> {
         let mut out = Vec::new();
-        for p in world
-            .prisms
-            .iter()
-            .filter(|p| p.kind == PrismKind::Building)
-        {
+        for p in world.prisms.iter().filter(|p| p.kind == PrismKind::Building) {
             let ring = &p.ring;
             let m = ring.len();
             let (mut a, mut cx, mut cy) = (0.0, 0.0, 0.0);
@@ -524,11 +499,7 @@ pub struct Flow {
 
 impl Flow {
     pub fn key(nav: &NavMap, x: f64, y: f64, r: f64) -> FieldKey {
-        (
-            (x / nav.cs).floor() as i64,
-            (y / nav.cs).floor() as i64,
-            (r / nav.cs).floor() as i64,
-        )
+        ((x / nav.cs).floor() as i64, (y / nav.cs).floor() as i64, (r / nav.cs).floor() as i64)
     }
 
     /// Ask for a flow field toward the disc (x, y, r). Work happens in `pump`.
@@ -563,9 +534,7 @@ impl Flow {
             }
         }
         if q.is_empty() {
-            let Some(c) = nav.nearest_free(x, y, 8) else {
-                return;
-            };
+            let Some(c) = nav.nearest_free(x, y, 8) else { return };
             dist[c] = 0.0;
             q.push_back(c);
         }
@@ -595,11 +564,7 @@ impl Flow {
                 if blocked[cc] != 0 {
                     continue;
                 }
-                if di != 0
-                    && dj != 0
-                    && (blocked[(j * nw + ii) as usize] != 0
-                        || blocked[(jj * nw + i) as usize] != 0)
-                {
+                if di != 0 && dj != 0 && (blocked[(j * nw + ii) as usize] != 0 || blocked[(jj * nw + i) as usize] != 0) {
                     continue;
                 }
                 let nd = d + w;
@@ -642,11 +607,7 @@ impl Flow {
                     let cc = (jj * nw + ii) as usize;
                     let fc = f64::from(f[cc]);
                     if fc >= 0.0 && fc < bd - 1e-3 {
-                        if di != 0
-                            && dj != 0
-                            && (nav.blocked[(j * nw + ii) as usize] != 0
-                                || nav.blocked[(jj * nw + i) as usize] != 0)
-                        {
+                        if di != 0 && dj != 0 && (nav.blocked[(j * nw + ii) as usize] != 0 || nav.blocked[(jj * nw + i) as usize] != 0) {
                             continue;
                         }
                         best = Some(cc);

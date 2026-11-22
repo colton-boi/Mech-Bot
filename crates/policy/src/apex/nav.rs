@@ -175,22 +175,13 @@ impl ApexNav {
         static CACHE: OnceLock<Mutex<HashMap<String, Arc<ApexNav>>>> = OnceLock::new();
         let key = format!(
             "{dir}|{}|{}|{}|{}|{}|{}",
-            mech.radius,
-            mech.height,
-            mech.eye_height,
-            mech.step_up,
-            mech.max_slope_deg,
-            vision.range
+            mech.radius, mech.height, mech.eye_height, mech.step_up, mech.max_slope_deg, vision.range
         );
-        let mut cache = CACHE
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut cache = CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
         if let Some(nav) = cache.get(&key) {
             return nav.clone();
         }
-        let world = World::shared(std::path::Path::new(dir))
-            .unwrap_or_else(|_| Arc::new(World::flat(600.0)));
+        let world = World::shared(std::path::Path::new(dir)).unwrap_or_else(|_| Arc::new(World::flat(600.0)));
         let nav = Arc::new(ApexNav::build(world, mech, vision));
         cache.insert(key, nav.clone());
         nav
@@ -225,8 +216,7 @@ impl ApexNav {
         let cell_of = |x: f64, y: f64| -> Option<usize> {
             let fi = ((x - min_x) / CELL).floor();
             let fj = ((y - min_y) / CELL).floor();
-            (fi >= 0.0 && fj >= 0.0 && (fi as usize) < nx && (fj as usize) < ny)
-                .then(|| fj as usize * nx + fi as usize)
+            (fi >= 0.0 && fj >= 0.0 && (fi as usize) < nx && (fj as usize) < ny).then(|| fj as usize * nx + fi as usize)
         };
         for p in &world.prisms {
             let mut apply = |k: usize, inside: bool| {
@@ -307,14 +297,10 @@ impl ApexNav {
             })
             .collect();
         let (comp, comp_size, main_id) = components(&walk, &surf, nx, ny, max_dh as f32);
-        let main: Vec<bool> = comp
-            .iter()
-            .map(|&c| c == main_id && c != u32::MAX)
-            .collect();
+        let main: Vec<bool> = comp.iter().map(|&c| c == main_id && c != u32::MAX).collect();
 
         let range = EXPOSURE_RANGE.min(vision.range.max(40.0));
-        let (ex_nx, ex_ny, exposure) =
-            exposure_grid(&obs, &surf, &walk, nx, ny, eye_height as f32, range);
+        let (ex_nx, ex_ny, exposure) = exposure_grid(&obs, &surf, &walk, nx, ny, eye_height as f32, range);
 
         ApexNav {
             world,
@@ -360,16 +346,12 @@ impl ApexNav {
     fn cell_ij(&self, x: f64, y: f64) -> Option<(usize, usize)> {
         let fi = ((x - self.min_x) / CELL).floor();
         let fj = ((y - self.min_y) / CELL).floor();
-        (fi >= 0.0 && fj >= 0.0 && (fi as usize) < self.nx && (fj as usize) < self.ny)
-            .then_some((fi as usize, fj as usize))
+        (fi >= 0.0 && fj >= 0.0 && (fi as usize) < self.nx && (fj as usize) < self.ny).then_some((fi as usize, fj as usize))
     }
 
     fn center(&self, k: usize) -> [f64; 2] {
         let (i, j) = (k % self.nx, k / self.nx);
-        [
-            self.min_x + (i as f64 + 0.5) * CELL,
-            self.min_y + (j as f64 + 0.5) * CELL,
-        ]
+        [self.min_x + (i as f64 + 0.5) * CELL, self.min_y + (j as f64 + 0.5) * CELL]
     }
 
     /// True when a mech can stand at `(x, y)` at ground level.
@@ -410,8 +392,7 @@ impl ApexNav {
 
     /// Ground-level walk surface of `(x, y)`'s cell, or the terrain off the grid.
     fn walk_surface(&self, x: f64, y: f64) -> f64 {
-        self.cell(x, y)
-            .map_or_else(|| self.ground_at(x, y), |k| f64::from(self.surf[k]))
+        self.cell(x, y).map_or_else(|| self.ground_at(x, y), |k| f64::from(self.surf[k]))
     }
 
     /// The walkable component `(x, y)` belongs to: its own cell's, else a main
@@ -423,16 +404,10 @@ impl ApexNav {
                 return Some(self.comp[k]);
             }
         }
-        if self.main_id != u32::MAX
-            && self
-                .nearest_cell(x, y, 2.0 * CELL, |k| self.main[k])
-                .is_some()
-        {
+        if self.main_id != u32::MAX && self.nearest_cell(x, y, 2.0 * CELL, |k| self.main[k]).is_some() {
             return Some(self.main_id);
         }
-        let k = self.nearest_cell(x, y, 2.0 * CELL, |k| {
-            self.walk[k] && self.comp[k] != u32::MAX
-        })?;
+        let k = self.nearest_cell(x, y, 2.0 * CELL, |k| self.walk[k] && self.comp[k] != u32::MAX)?;
         Some(self.comp[k])
     }
 
@@ -495,24 +470,13 @@ impl ApexNav {
         if self.cell(x, y).is_some_and(|k| self.comp[k] == area) {
             return Some([x, y]);
         }
-        self.nearest_cell(x, y, max_r, |k| self.comp[k] == area)
-            .map(|k| self.center(k))
+        self.nearest_cell(x, y, max_r, |k| self.comp[k] == area).map(|k| self.center(k))
     }
 
     /// The cell nearest `(x, y)` (by center distance, within `max_r`) passing `ok`.
-    fn nearest_cell(
-        &self,
-        x: f64,
-        y: f64,
-        max_r: f64,
-        ok: impl Fn(usize) -> bool,
-    ) -> Option<usize> {
-        let ci = ((x - self.min_x) / CELL)
-            .floor()
-            .clamp(0.0, (self.nx - 1) as f64) as isize;
-        let cj = ((y - self.min_y) / CELL)
-            .floor()
-            .clamp(0.0, (self.ny - 1) as f64) as isize;
+    fn nearest_cell(&self, x: f64, y: f64, max_r: f64, ok: impl Fn(usize) -> bool) -> Option<usize> {
+        let ci = ((x - self.min_x) / CELL).floor().clamp(0.0, (self.nx - 1) as f64) as isize;
+        let cj = ((y - self.min_y) / CELL).floor().clamp(0.0, (self.ny - 1) as f64) as isize;
         // A point off the grid starts its rings at the nearest edge cell.
         let off = dist_xy([x, y], self.center(cj as usize * self.nx + ci as usize));
         let rings = ((max_r + off) / CELL).ceil() as isize + 1;
@@ -571,12 +535,8 @@ impl ApexNav {
         }
         let s = self.cell(start[0], start[1])?;
         // A goal off the grid aims at the nearest edge cell.
-        let ti = ((goal[0] - self.min_x) / CELL)
-            .floor()
-            .clamp(0.0, (self.nx - 1) as f64) as usize;
-        let tj = ((goal[1] - self.min_y) / CELL)
-            .floor()
-            .clamp(0.0, (self.ny - 1) as f64) as usize;
+        let ti = ((goal[0] - self.min_x) / CELL).floor().clamp(0.0, (self.nx - 1) as f64) as usize;
+        let tj = ((goal[1] - self.min_y) / CELL).floor().clamp(0.0, (self.ny - 1) as f64) as usize;
         let t = tj * self.nx + ti;
         let nx = self.nx as isize;
         let ny = self.ny as isize;
@@ -587,8 +547,7 @@ impl ApexNav {
             sc.stamp[s] = gen;
             sc.g[s] = 0.0;
             sc.parent[s] = u32::MAX;
-            sc.heap
-                .push(Reverse(((ASTAR_W * self.octile(s, t)).to_bits(), s as u32)));
+            sc.heap.push(Reverse(((ASTAR_W * self.octile(s, t)).to_bits(), s as u32)));
             let mut best = (self.octile(s, t), s);
             let mut expanded = 0usize;
             while let Some(Reverse((_, u))) = sc.heap.pop() {
@@ -618,11 +577,7 @@ impl ApexNav {
                     if self.comp[v] != area || sc.closed[v] == gen {
                         continue;
                     }
-                    if di != 0
-                        && dj != 0
-                        && !(self.comp[(uj * nx + vi) as usize] == area
-                            && self.comp[(vj * nx + ui) as usize] == area)
-                    {
+                    if di != 0 && dj != 0 && !(self.comp[(uj * nx + vi) as usize] == area && self.comp[(vj * nx + ui) as usize] == area) {
                         continue;
                     }
                     if f64::from((self.surf[v] - self.surf[u]).abs()) > self.max_dh {
@@ -676,24 +631,13 @@ impl ApexNav {
     /// The waypoint to steer at from `pos` along `path`, starting from index
     /// `idx`: the furthest of the next few points that can be walked to in a
     /// straight line (within `pos`'s component), with its index. Falls back to `path[idx]`.
-    pub fn string_pull_waypoint(
-        &self,
-        pos: [f64; 2],
-        path: &[[f64; 2]],
-        idx: usize,
-    ) -> (usize, [f64; 2]) {
+    pub fn string_pull_waypoint(&self, pos: [f64; 2], path: &[[f64; 2]], idx: usize) -> (usize, [f64; 2]) {
         let area = self.area_of(pos[0], pos[1]).unwrap_or(self.main_id);
         self.string_pull_waypoint_in(pos, path, idx, area)
     }
 
     /// `string_pull_waypoint` with straight walks tested inside component `area`.
-    pub fn string_pull_waypoint_in(
-        &self,
-        pos: [f64; 2],
-        path: &[[f64; 2]],
-        idx: usize,
-        area: u32,
-    ) -> (usize, [f64; 2]) {
+    pub fn string_pull_waypoint_in(&self, pos: [f64; 2], path: &[[f64; 2]], idx: usize, area: u32) -> (usize, [f64; 2]) {
         if path.is_empty() {
             return (0, pos);
         }
@@ -724,58 +668,16 @@ impl ApexNav {
         let start = self.cell(pos[0], pos[1])?;
         let at_ground = s0 <= f64::from(self.surf[start]) + self.step_up;
         // At ground level beside a wall the disc sits in an eroded cell; a main cell close by means walk, not jump.
-        if at_ground
-            && (self.main[start] || self.snap_to_main(pos[0], pos[1], 2.0 * CELL).is_some())
-        {
+        if at_ground && (self.main[start] || self.snap_to_main(pos[0], pos[1], 2.0 * CELL).is_some()) {
             return None;
         }
         // A big ground basin is a place to live, not a trap: only hop out when
         // the main area is close, and only from launch cells nearby.
-        let big_basin = at_ground
-            && self
-                .area_of(pos[0], pos[1])
-                .is_some_and(|c| c != u32::MAX && self.comp_size[c as usize] >= 400);
+        let big_basin = at_ground && self.area_of(pos[0], pos[1]).is_some_and(|c| c != u32::MAX && self.comp_size[c as usize] >= 400);
         if big_basin && self.snap_to_main(pos[0], pos[1], 28.0).is_none() {
             return None;
         }
-        // BFS over the cells reachable at this level.
-        let mut seen: HashMap<usize, (f64, f64)> = HashMap::new();
-        let mut queue = VecDeque::new();
-        seen.insert(start, (s0, 0.0));
-        queue.push_back(start);
-        let mut edges: Vec<(usize, f64, f64)> = Vec::new();
-        while let Some(u) = queue.pop_front() {
-            let (su, du) = seen[&u];
-            let (ui, uj) = ((u % self.nx) as isize, (u / self.nx) as isize);
-            let mut at_edge = false;
-            for (di, dj) in [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)] {
-                let (vi, vj) = (ui + di, uj + dj);
-                if vi < 0 || vj < 0 || vi as usize >= self.nx || vj as usize >= self.ny {
-                    at_edge = true;
-                    continue;
-                }
-                let v = vj as usize * self.nx + vi as usize;
-                if seen.contains_key(&v) {
-                    continue;
-                }
-                let c = self.center(v);
-                let sv = self.world.surface_at(c[0], c[1], su + self.step_up + 0.05);
-                // No walking up (or down) cliffs taller than a step.
-                let level = sv >= su - self.step_up
-                    && (sv - su).abs() <= self.max_dh
-                    && !self.wall_at(c[0], c[1], sv);
-                let main_level = self.main[v] && sv <= f64::from(self.surf[v]) + self.step_up;
-                if level && !main_level && seen.len() < ESCAPE_MAX_CELLS {
-                    seen.insert(v, (sv, du + CELL));
-                    queue.push_back(v);
-                } else if !level || main_level {
-                    at_edge = true;
-                }
-            }
-            if at_edge {
-                edges.push((u, su, du));
-            }
-        }
+        let edges = self.escape_edges(start, s0, ESCAPE_MAX_CELLS);
         let mut best: Option<(f64, EscapePlan)> = None;
         for &(u, su, du) in &edges {
             let launch = self.center(u);
@@ -785,14 +687,8 @@ impl ApexNav {
             for b in 0..8 {
                 let ang = b as f64 * TAU / 8.0;
                 let dir = [ang.cos(), ang.sin()];
-                let edge = [
-                    launch[0] + dir[0] * 0.5 * CELL,
-                    launch[1] + dir[1] * 0.5 * CELL,
-                ];
-                let Some(&land_d) = ESCAPE_LAND
-                    .iter()
-                    .find(|&&d| self.is_main_xy(edge[0] + dir[0] * d, edge[1] + dir[1] * d))
-                else {
+                let edge = [launch[0] + dir[0] * 0.5 * CELL, launch[1] + dir[1] * 0.5 * CELL];
+                let Some(&land_d) = ESCAPE_LAND.iter().find(|&&d| self.is_main_xy(edge[0] + dir[0] * d, edge[1] + dir[1] * d)) else {
                     continue;
                 };
                 let land = [edge[0] + dir[0] * land_d, edge[1] + dir[1] * land_d];
@@ -815,14 +711,149 @@ impl ApexNav {
                 }
             }
         }
-        best.map(|(_, plan)| plan)
+        if let Some((_, plan)) = best {
+            return Some(plan);
+        }
+
+        // 2-stage roof-escape fallback when no direct single-hop to `main` exists:
+        // jump to a different component or an elevated walkable roof cell (+1.5..+8.5 m)
+        // that can reach `main` via another hop or brings us closer to `main`/center.
+        let start_comp = (self.comp[start] != u32::MAX)
+            .then_some(self.comp[start])
+            .or_else(|| self.area_of(pos[0], pos[1]));
+        let bnd = self.world.bounds;
+        let map_center = [0.5 * (bnd.min_x + bnd.max_x), 0.5 * (bnd.min_y + bnd.max_y)];
+        let main_target = self.snap_to_main(pos[0], pos[1], 120.0).unwrap_or(map_center);
+        let cur_to_main = dist_xy([pos[0], pos[1]], main_target);
+        let cur_to_center = dist_xy([pos[0], pos[1]], map_center);
+        let mut fallback: Option<(f64, EscapePlan)> = None;
+        for &(u, su, du) in &edges {
+            let launch = self.center(u);
+            if big_basin && dist_xy(launch, [pos[0], pos[1]]) > 16.0 {
+                continue;
+            }
+            for b in 0..8 {
+                let ang = b as f64 * TAU / 8.0;
+                let dir = [ang.cos(), ang.sin()];
+                let edge = [launch[0] + dir[0] * 0.5 * CELL, launch[1] + dir[1] * 0.5 * CELL];
+                for &land_d in &ESCAPE_LAND {
+                    let land = [edge[0] + dir[0] * land_d, edge[1] + dir[1] * land_d];
+                    let Some(land_cell) = self.cell(land[0], land[1]) else {
+                        continue;
+                    };
+                    let z_land = self.world.surface_at(land[0], land[1], f64::INFINITY);
+                    if self.wall_at(land[0], land[1], z_land) {
+                        continue;
+                    }
+                    let diff_comp = self.walk[land_cell]
+                        && self.comp[land_cell] != u32::MAX
+                        && Some(self.comp[land_cell]) != start_comp
+                        && z_land <= f64::from(self.surf[land_cell]) + self.step_up;
+                    let higher_roof = z_land > su + 1.5 && z_land <= su + 8.5;
+                    if !diff_comp && !higher_roof {
+                        continue;
+                    }
+                    let need_z = self.max_obstacle(launch, land) + 2.5;
+                    if need_z > s0 + 28.0 || need_z > su + 28.0 || dist_xy(launch, land) > 30.0 {
+                        continue;
+                    }
+                    let reaches_main = self.can_reach_main_next([land[0], land[1], z_land]);
+                    let d_main = dist_xy(land, main_target);
+                    let d_center = dist_xy(land, map_center);
+                    if !reaches_main && d_main >= cur_to_main && d_center >= cur_to_center {
+                        continue;
+                    }
+                    let score = if reaches_main { 0.0 } else { 10_000.0 } + 10.0 * (z_land - su).max(0.0) + d_main + 0.25 * (du + land_d);
+                    if fallback.as_ref().is_none_or(|(bs, _)| score < *bs) {
+                        fallback = Some((
+                            score,
+                            EscapePlan {
+                                launch_xy: launch,
+                                land_xy: land,
+                                need_z,
+                                jump_dir: dir,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        fallback.map(|(_, plan)| plan)
+    }
+
+    /// BFS over level cells reachable from `(start, s0)`, returning edge cells `(cell, surf_z, walk_dist)`.
+    fn escape_edges(&self, start: usize, s0: f64, max_cells: usize) -> Vec<(usize, f64, f64)> {
+        let mut seen: HashMap<usize, (f64, f64)> = HashMap::new();
+        let mut queue = VecDeque::new();
+        seen.insert(start, (s0, 0.0));
+        queue.push_back(start);
+        let mut edges: Vec<(usize, f64, f64)> = Vec::new();
+        while let Some(u) = queue.pop_front() {
+            let (su, du) = seen[&u];
+            let (ui, uj) = ((u % self.nx) as isize, (u / self.nx) as isize);
+            let mut at_edge = false;
+            for (di, dj) in [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)] {
+                let (vi, vj) = (ui + di, uj + dj);
+                if vi < 0 || vj < 0 || vi as usize >= self.nx || vj as usize >= self.ny {
+                    at_edge = true;
+                    continue;
+                }
+                let v = vj as usize * self.nx + vi as usize;
+                if seen.contains_key(&v) {
+                    continue;
+                }
+                let c = self.center(v);
+                let sv = self.world.surface_at(c[0], c[1], su + self.step_up + 0.05);
+                // No walking up (or down) cliffs taller than a step.
+                let level = sv >= su - self.step_up && (sv - su).abs() <= self.max_dh && !self.wall_at(c[0], c[1], sv);
+                let main_level = self.main[v] && sv <= f64::from(self.surf[v]) + self.step_up;
+                if level && !main_level && seen.len() < max_cells {
+                    seen.insert(v, (sv, du + CELL));
+                    queue.push_back(v);
+                } else if !level || main_level {
+                    at_edge = true;
+                }
+            }
+            if at_edge {
+                edges.push((u, su, du));
+            }
+        }
+        edges
+    }
+
+    /// True if standing at `pos` can reach `main` in one subsequent hop.
+    fn can_reach_main_next(&self, pos: [f64; 3]) -> bool {
+        if self.is_main_xy(pos[0], pos[1]) {
+            return true;
+        }
+        let Some(start) = self.cell(pos[0], pos[1]) else {
+            return false;
+        };
+        let edges = self.escape_edges(start, pos[2], 400);
+        for &(u, su, _) in &edges {
+            let launch = self.center(u);
+            for b in 0..8 {
+                let ang = b as f64 * TAU / 8.0;
+                let dir = [ang.cos(), ang.sin()];
+                let edge = [launch[0] + dir[0] * 0.5 * CELL, launch[1] + dir[1] * 0.5 * CELL];
+                let Some(&land_d) = ESCAPE_LAND.iter().find(|&&d| self.is_main_xy(edge[0] + dir[0] * d, edge[1] + dir[1] * d)) else {
+                    continue;
+                };
+                let land = [edge[0] + dir[0] * land_d, edge[1] + dir[1] * land_d];
+                let need_z = self.max_obstacle(launch, land) + 2.5;
+                if need_z <= pos[2] + 28.0 && need_z <= su + 28.0 && dist_xy(launch, land) <= 30.0 {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// True when a prism rises from below `z + height` to above `z + step_up` at `(x, y)`.
     fn wall_at(&self, x: f64, y: f64, z: f64) -> bool {
-        self.world.prisms_at(x, y).any(|(_, p)| {
-            p.top > z + self.step_up && p.base < z + self.height - 0.1 && p.contains_xy(x, y)
-        })
+        self.world
+            .prisms_at(x, y)
+            .any(|(_, p)| p.top > z + self.step_up && p.base < z + self.height - 0.1 && p.contains_xy(x, y))
     }
 
     /// Highest terrain or prism top on the segment `a -> b`, sampled every meter.
@@ -831,11 +862,7 @@ impl ApexNav {
         (0..=steps)
             .map(|s| {
                 let t = s as f64 / steps as f64;
-                self.world.surface_at(
-                    a[0] + (b[0] - a[0]) * t,
-                    a[1] + (b[1] - a[1]) * t,
-                    f64::INFINITY,
-                )
+                self.world.surface_at(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, f64::INFINITY)
             })
             .fold(f64::NEG_INFINITY, f64::max)
     }
@@ -843,23 +870,12 @@ impl ApexNav {
     /// The best spot among `rings` x `bearings` around `me` hidden from the
     /// nearest four threats, scored by distance minus a quarter of the
     /// distance to the closest threat.
-    fn cover_search(
-        &self,
-        me: [f64; 3],
-        threats: &[ThreatInfo],
-        zone: &ZoneObs,
-        require_trees: bool,
-        rings: &[f64],
-        bearings: &[f64],
-    ) -> Option<[f64; 3]> {
+    fn cover_search(&self, me: [f64; 3], threats: &[ThreatInfo], zone: &ZoneObs, require_trees: bool, rings: &[f64], bearings: &[f64]) -> Option<[f64; 3]> {
         let ts = nearest_threats(me, threats, 4);
         if ts.is_empty() {
             return None;
         }
-        let eyes: Vec<[f64; 3]> = ts
-            .iter()
-            .map(|t| [t.pos[0], t.pos[1], t.pos[2] + self.eye_height])
-            .collect();
+        let eyes: Vec<[f64; 3]> = ts.iter().map(|t| [t.pos[0], t.pos[1], t.pos[2] + self.eye_height]).collect();
         let mut best: Option<(f64, [f64; 3])> = None;
         for &r in rings {
             for &ang in bearings {
@@ -867,10 +883,7 @@ impl ApexNav {
                 if !self.is_main_xy(x, y) || !in_zone(zone, x, y) {
                     continue;
                 }
-                let min_threat = ts
-                    .iter()
-                    .map(|t| (t.pos[0] - x).hypot(t.pos[1] - y))
-                    .fold(f64::INFINITY, f64::min);
+                let min_threat = ts.iter().map(|t| (t.pos[0] - x).hypot(t.pos[1] - y)).fold(f64::INFINITY, f64::min);
                 let score = r - 0.25 * min_threat;
                 if best.is_some_and(|(bs, _)| score >= bs) {
                     continue;
@@ -878,13 +891,9 @@ impl ApexNav {
                 let z = self.walk_surface(x, y);
                 let targets = [[x, y, z + 0.5 * self.height], [x, y, z + 0.9 * self.height]];
                 let hidden = eyes.iter().all(|&e| {
-                    targets.iter().all(|&p| {
-                        if require_trees {
-                            !self.world.sight(e, p)
-                        } else {
-                            !self.world.los(e, p)
-                        }
-                    })
+                    targets
+                        .iter()
+                        .all(|&p| if require_trees { !self.world.sight(e, p) } else { !self.world.los(e, p) })
                 });
                 if hidden {
                     best = Some((score, [x, y, z]));
@@ -897,65 +906,69 @@ impl ApexNav {
     /// A walkable spot within `max_r` that the nearest threats cannot see:
     /// rings at 8, 16, 26, 38, and 52 m by 16 bearings. With `require_trees`
     /// the test is full sight (canopy counts as cover), otherwise solid line of sight.
-    pub fn find_cover(
-        &self,
-        me_pos: [f64; 3],
-        threats: &[ThreatInfo],
-        zone: &ZoneObs,
-        require_trees: bool,
-        max_r: f64,
-    ) -> Option<[f64; 3]> {
-        let rings: Vec<f64> = [8.0, 16.0, 26.0, 38.0, 52.0]
-            .into_iter()
-            .filter(|&r| r <= max_r)
-            .collect();
+    pub fn find_cover(&self, me_pos: [f64; 3], threats: &[ThreatInfo], zone: &ZoneObs, require_trees: bool, max_r: f64) -> Option<[f64; 3]> {
+        let rings: Vec<f64> = [8.0, 16.0, 26.0, 38.0, 52.0].into_iter().filter(|&r| r <= max_r).collect();
         let bearings: Vec<f64> = (0..16).map(|b| b as f64 * TAU / 16.0).collect();
         self.cover_search(me_pos, threats, zone, require_trees, &rings, &bearings)
     }
 
     /// `find_cover` on a small fan: 8, 15, and 24 m by 8 bearings starting
     /// from the bearing away from the nearest threat.
-    pub fn find_commit_cover(
-        &self,
-        me_pos: [f64; 3],
-        threats: &[ThreatInfo],
-        zone: &ZoneObs,
-        require_trees: bool,
-    ) -> Option<[f64; 3]> {
+    pub fn find_commit_cover(&self, me_pos: [f64; 3], threats: &[ThreatInfo], zone: &ZoneObs, require_trees: bool) -> Option<[f64; 3]> {
         let nearest = nearest_threats(me_pos, threats, 1);
         let t = nearest.first()?;
         let away = (me_pos[1] - t.pos[1]).atan2(me_pos[0] - t.pos[0]);
         // Away first, then alternating sides of it.
-        let bearings: Vec<f64> = [0.0, 1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0]
-            .iter()
-            .map(|k| away + k * TAU / 8.0)
-            .collect();
-        self.cover_search(
-            me_pos,
-            threats,
-            zone,
-            require_trees,
-            &[8.0, 15.0, 24.0],
-            &bearings,
-        )
+        let bearings: Vec<f64> = [0.0, 1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0].iter().map(|k| away + k * TAU / 8.0).collect();
+        self.cover_search(me_pos, threats, zone, require_trees, &[8.0, 15.0, 24.0], &bearings)
     }
 
     /// True when `find_commit_cover` finds a spot.
-    pub fn has_cover_nearby(
-        &self,
-        me_pos: [f64; 3],
-        threats: &[ThreatInfo],
-        zone: &ZoneObs,
-        require_trees: bool,
-    ) -> bool {
-        self.find_commit_cover(me_pos, threats, zone, require_trees)
-            .is_some()
+    pub fn has_cover_nearby(&self, me_pos: [f64; 3], threats: &[ThreatInfo], zone: &ZoneObs, require_trees: bool) -> bool {
+        self.find_commit_cover(me_pos, threats, zone, require_trees).is_some()
     }
 
-    /// A low-exposure spot to hold, sampled in a band at `ring_frac` of the
-    /// next zone radius from its center (the current one when the next is unknown). Cost is
-    /// `exp_w * exposure + crowd_pen * crowd` plus a small distance term, where
-    /// crowd counts nearby threats and supply drops.
+    /// Cost of a home spot `p`: balances exposure, nearby threats/drops, travel
+    /// distance from `me_pos`, shelter (tree canopy or solid wall hug), and a
+    /// mild pull away from the zone rim.
+    #[allow(clippy::too_many_arguments)]
+    pub fn home_spot_cost(&self, me_pos: [f64; 3], p: [f64; 2], zone: &ZoneObs, exp_w: f64, crowd_pen: f64, threats: &[ThreatInfo], drops: &[DropObs]) -> f64 {
+        let (center, radius) = if zone.next_radius > 0.0 {
+            (zone.next_center, zone.next_radius)
+        } else if zone.radius > 0.0 {
+            (zone.center, zone.radius)
+        } else {
+            ([me_pos[0], me_pos[1]], 60.0)
+        };
+        let me = [me_pos[0], me_pos[1]];
+        let crowd: f64 = threats
+            .iter()
+            .map(|t| (1.0 - (t.pos[0] - p[0]).hypot(t.pos[1] - p[1]) / 100.0).max(0.0))
+            .sum::<f64>()
+            + drops
+                .iter()
+                .map(|d| 0.5 * (1.0 - (d.pos[0] - p[0]).hypot(d.pos[1] - p[1]) / 80.0).max(0.0))
+                .sum::<f64>();
+        let drop_pen = if drops.iter().any(|d| (d.pos[0] - p[0]).hypot(d.pos[1] - p[1]) <= 60.0) {
+            25.0
+        } else {
+            0.0
+        };
+        let exp = self.exposure_at(p[0], p[1]);
+        let clear = self.clearance_at(p[0], p[1]);
+        let under_canopy = self
+            .world
+            .trees
+            .iter()
+            .any(|tr| tr.crown_r > 0.0 && (p[0] - tr.crown_x).hypot(p[1] - tr.crown_y) <= tr.crown_r);
+        let wall_hug = (2.5..=6.5).contains(&clear) && exp < 0.55;
+        let shelter_bonus = if under_canopy || wall_hug { -20.0 } else { 0.0 };
+        exp_w * exp + crowd_pen * crowd + drop_pen + shelter_bonus + 0.22 * dist_xy(me, p) + 10.0 * dist_xy(p, center) / radius.max(30.0)
+    }
+
+    /// A low-exposure spot to hold, sampled across the disc inside `ring_frac` of
+    /// the next zone radius from its center (the current one when the next is unknown),
+    /// also considering staying put at `me_pos` if already in range.
     #[allow(clippy::too_many_arguments)]
     pub fn sample_home_spot(
         &self,
@@ -985,27 +998,18 @@ impl ApexNav {
                 self.cell(p[0], p[1]).is_some_and(|k| self.comp[k] == area)
             }
         };
-        let cost = |p: [f64; 2]| {
-            let crowd: f64 = threats
-                .iter()
-                .map(|t| (1.0 - (t.pos[0] - p[0]).hypot(t.pos[1] - p[1]) / 100.0).max(0.0))
-                .sum::<f64>()
-                + drops
-                    .iter()
-                    .map(|d| 0.5 * (1.0 - (d.pos[0] - p[0]).hypot(d.pos[1] - p[1]) / 80.0).max(0.0))
-                    .sum::<f64>();
-            exp_w * self.exposure_at(p[0], p[1]) + crowd_pen * crowd + 0.02 * dist_xy(me, p)
-        };
         let mut best: Option<(f64, [f64; 2])> = None;
-        for _ in 0..40 {
+        if in_area(me) && in_zone(zone, me[0], me[1]) && dist_xy(me, center) <= reach {
+            best = Some((self.home_spot_cost(me_pos, me, zone, exp_w, crowd_pen, threats, drops), me));
+        }
+        for _ in 0..48 {
             let ang = rng.range(0.0, TAU);
-            // A band around the hold distance, not the whole disc.
-            let r = (reach + rng.range(-0.15, 0.15) * radius).max(0.0);
+            let r = rng.next_f64().sqrt() * reach;
             let p = [center[0] + r * ang.cos(), center[1] + r * ang.sin()];
             if !in_area(p) || !in_zone(zone, p[0], p[1]) {
                 continue;
             }
-            let c = cost(p);
+            let c = self.home_spot_cost(me_pos, p, zone, exp_w, crowd_pen, threats, drops);
             if best.is_none_or(|(bc, _)| c < bc) {
                 best = Some((c, p));
             }
@@ -1065,10 +1069,7 @@ fn trace(sc: &Scratch, end: usize) -> Vec<usize> {
 /// the grid edge), minus half a cell: a two-pass 3x3 chamfer transform.
 fn chamfer_clearance(free: &[bool], nx: usize, ny: usize) -> Vec<f32> {
     let (a, d) = (CELL as f32, (CELL * SQRT_2) as f32);
-    let mut dist: Vec<f32> = free
-        .iter()
-        .map(|&f| if f { f32::INFINITY } else { 0.0 })
-        .collect();
+    let mut dist: Vec<f32> = free.iter().map(|&f| if f { f32::INFINITY } else { 0.0 }).collect();
     let at = |dist: &[f32], i: isize, j: isize| -> f32 {
         if i < 0 || j < 0 || i as usize >= nx || j as usize >= ny {
             0.0
@@ -1105,21 +1106,13 @@ fn chamfer_clearance(free: &[bool], nx: usize, ny: usize) -> Vec<f32> {
         }
     }
     let half = 0.5 * CELL as f32;
-    dist.iter()
-        .map(|&v| if v > 0.0 { (v - half).max(0.0) } else { 0.0 })
-        .collect()
+    dist.iter().map(|&v| if v > 0.0 { (v - half).max(0.0) } else { 0.0 }).collect()
 }
 
 /// Labels the 4-connected walkable components (steps up to `max_dh`):
 /// `(comp, comp_size, main_id)` with `comp` the per-cell id (`u32::MAX` where
 /// not walkable), `comp_size` the cell count per id, and `main_id` the largest.
-fn components(
-    walk: &[bool],
-    surf: &[f32],
-    nx: usize,
-    ny: usize,
-    max_dh: f32,
-) -> (Vec<u32>, Vec<u32>, u32) {
+fn components(walk: &[bool], surf: &[f32], nx: usize, ny: usize, max_dh: f32) -> (Vec<u32>, Vec<u32>, u32) {
     let n = walk.len();
     let mut label = vec![u32::MAX; n];
     let mut best = (0usize, u32::MAX);
@@ -1166,15 +1159,7 @@ fn components(
 /// The 4 m exposure grid: for each patch with a walkable cell, the fraction
 /// of `EXPOSURE_RAYS` horizontal eye-level rays out to `range` meters that
 /// meet nothing taller than the eye on the 2 m obstruction raster.
-fn exposure_grid(
-    obs: &[f32],
-    surf: &[f32],
-    walk: &[bool],
-    nx: usize,
-    ny: usize,
-    eye_height: f32,
-    range: f64,
-) -> (usize, usize, Vec<u8>) {
+fn exposure_grid(obs: &[f32], surf: &[f32], walk: &[bool], nx: usize, ny: usize, eye_height: f32, range: f64) -> (usize, usize, Vec<u8>) {
     let steps = (range / CELL).floor().max(1.0) as isize;
     let pad = steps as usize + 1;
     let pnx = nx + 2 * pad;
@@ -1208,21 +1193,16 @@ fn exposure_grid(
     for ej in 0..ex_ny {
         for ei in 0..ex_nx {
             // The first walkable cell of the patch is its eye position.
-            let origin = [(0, 0), (1, 0), (0, 1), (1, 1)]
-                .iter()
-                .find_map(|&(oi, oj)| {
-                    let (i, j) = (2 * ei + oi, 2 * ej + oj);
-                    (i < nx && j < ny && walk[j * nx + i]).then_some((i, j))
-                });
+            let origin = [(0, 0), (1, 0), (0, 1), (1, 1)].iter().find_map(|&(oi, oj)| {
+                let (i, j) = (2 * ei + oi, 2 * ej + oj);
+                (i < nx && j < ny && walk[j * nx + i]).then_some((i, j))
+            });
             let Some((i, j)) = origin else {
                 continue;
             };
             let eye = surf[j * nx + i] + eye_height;
             let base = ((j + pad) * pnx + i + pad) as isize;
-            let open = rays
-                .iter()
-                .filter(|offs| offs.iter().all(|&o| raster[(base + o) as usize] <= eye))
-                .count();
+            let open = rays.iter().filter(|offs| offs.iter().all(|&o| raster[(base + o) as usize] <= eye)).count();
             exposure[ej * ex_nx + ei] = ((open * 255 + EXPOSURE_RAYS / 2) / EXPOSURE_RAYS) as u8;
         }
     }
@@ -1269,13 +1249,7 @@ mod tests {
     /// Flat 200 m square with a 4 m thick, 120 m long, 20 m tall wall along x = 0.
     fn walled() -> ApexNav {
         let mut w = World::flat(100.0);
-        w.prisms.push(Prism::rect(
-            PrismKind::Building,
-            [-2.0, -60.0],
-            [2.0, 60.0],
-            0.0,
-            20.0,
-        ));
+        w.prisms.push(Prism::rect(PrismKind::Building, [-2.0, -60.0], [2.0, 60.0], 0.0, 20.0));
         nav_of(w)
     }
 
@@ -1291,10 +1265,7 @@ mod tests {
     fn flat_world_is_open_and_paths_are_straight() {
         let nav = nav_of(World::flat(100.0));
         assert!(nav.is_walkable_xy(0.0, 0.0) && nav.is_main_xy(10.0, -20.0));
-        assert!(
-            !nav.is_walkable_xy(99.5, 0.0),
-            "the map edge counts as an obstacle"
-        );
+        assert!(!nav.is_walkable_xy(99.5, 0.0), "the map edge counts as an obstacle");
         assert!(nav.clearance_at(0.0, 0.0) > 50.0);
         assert!((nav.exposure_at(0.0, 0.0) - 1.0).abs() < 1e-9);
         assert_eq!(nav.ground_at(3.0, 4.0), 0.0);
@@ -1303,10 +1274,7 @@ mod tests {
         assert!(nav.walk_line([-50.0, 0.0], [50.0, 0.0]));
         assert!(!nav.step_blocked_ahead([0.0, 0.0, 0.0], [1.0, 0.0], 5.0));
         assert!(nav.find_escape([0.0, 0.0, 0.0]).is_none());
-        assert_eq!(
-            nav.snap_to_main(150.0, 0.0, 60.0).map(|p| p[1].abs() < 2.0),
-            Some(true)
-        );
+        assert_eq!(nav.snap_to_main(150.0, 0.0, 60.0).map(|p| p[1].abs() < 2.0), Some(true));
         assert!(nav.snap_to_main(150.0, 0.0, 10.0).is_none());
     }
 
@@ -1314,33 +1282,18 @@ mod tests {
     fn walls_block_walking_and_paths_go_around() {
         let nav = walled();
         assert!(!nav.is_walkable_xy(0.0, 0.0));
-        assert!(
-            !nav.is_walkable_xy(3.0, 0.0),
-            "too close to the wall for the mech's disc"
-        );
+        assert!(!nav.is_walkable_xy(3.0, 0.0), "too close to the wall for the mech's disc");
         assert!(nav.is_main_xy(-10.0, 0.0) && nav.is_main_xy(10.0, 0.0));
         assert!(!nav.walk_line([-20.0, 0.0], [20.0, 0.0]));
         let start = [-20.0, 0.0];
         let path = nav.find_path(start, [20.0, 0.0]).unwrap();
         assert_eq!(*path.last().unwrap(), [20.0, 0.0]);
         for w in path.windows(2) {
-            assert!(
-                nav.walk_line(w[0], w[1]),
-                "leg {:?} -> {:?} is walkable",
-                w[0],
-                w[1]
-            );
+            assert!(nav.walk_line(w[0], w[1]), "leg {:?} -> {:?} is walkable", w[0], w[1]);
         }
-        assert!(
-            path.iter().any(|p| p[1].abs() > 60.0),
-            "the route rounds an end of the wall"
-        );
+        assert!(path.iter().any(|p| p[1].abs() > 60.0), "the route rounds an end of the wall");
         assert!(path_len(start, &path) > 120.0);
-        assert!(
-            path.len() < 12,
-            "string pulling leaves few waypoints, got {}",
-            path.len()
-        );
+        assert!(path.len() < 12, "string pulling leaves few waypoints, got {}", path.len());
         let (i, wp) = nav.string_pull_waypoint(start, &path, 0);
         assert!(i >= 1 && nav.walk_line(start, wp));
         assert!(nav.step_blocked_ahead([-6.0, 0.0, 0.0], [1.0, 0.0], 3.0));
@@ -1353,13 +1306,9 @@ mod tests {
         let zone = ZoneObs::default();
         let foe = threat([40.0, 0.0, 0.0]);
         let me = [-6.0, 10.0, 0.0];
-        let spot = nav
-            .find_cover(me, &[foe], &zone, false, 60.0)
-            .expect("cover west of the wall");
+        let spot = nav.find_cover(me, &[foe], &zone, false, 60.0).expect("cover west of the wall");
         assert!(spot[0] < -2.0 && spot[1].abs() < 55.0, "spot {spot:?}");
-        assert!(!nav
-            .world()
-            .los([40.0, 0.0, 8.0], [spot[0], spot[1], spot[2] + 4.5]));
+        assert!(!nav.world().los([40.0, 0.0, 8.0], [spot[0], spot[1], spot[2] + 4.5]));
         assert!(nav.has_cover_nearby(me, &[foe], &zone, false));
         let commit = nav.find_commit_cover(me, &[foe], &zone, false).unwrap();
         assert!(commit[0] < -2.0);
@@ -1389,13 +1338,7 @@ mod tests {
     #[test]
     fn bridges_stay_passable_underneath() {
         let mut w = World::flat(100.0);
-        w.prisms.push(Prism::rect(
-            PrismKind::Bridge,
-            [-30.0, -5.0],
-            [30.0, 5.0],
-            15.0,
-            16.0,
-        ));
+        w.prisms.push(Prism::rect(PrismKind::Bridge, [-30.0, -5.0], [30.0, 5.0], 15.0, 16.0));
         let nav = nav_of(w);
         assert!(nav.is_main_xy(0.0, 0.0));
         assert!(nav.walk_line([0.0, -40.0], [0.0, 40.0]));
@@ -1404,42 +1347,18 @@ mod tests {
     #[test]
     fn escape_off_a_roof_lands_on_the_main_area() {
         let mut w = World::flat(100.0);
-        w.prisms.push(Prism::rect(
-            PrismKind::Building,
-            [-10.0, -10.0],
-            [10.0, 10.0],
-            0.0,
-            12.0,
-        ));
+        w.prisms.push(Prism::rect(PrismKind::Building, [-10.0, -10.0], [10.0, 10.0], 0.0, 12.0));
         let nav = nav_of(w);
-        let plan = nav
-            .find_escape([0.0, 0.0, 12.0])
-            .expect("a way off the roof");
+        let plan = nav.find_escape([0.0, 0.0, 12.0]).expect("a way off the roof");
         assert!(nav.is_main_xy(plan.land_xy[0], plan.land_xy[1]));
         assert!(plan.need_z >= 14.5);
         assert!(plan.launch_xy[0].abs() <= 10.0 && plan.launch_xy[1].abs() <= 10.0);
-        let to_land = unit([
-            plan.land_xy[0] - plan.launch_xy[0],
-            plan.land_xy[1] - plan.launch_xy[1],
-        ])
-        .unwrap();
-        assert!(
-            (to_land[0] - plan.jump_dir[0]).abs() < 1e-9
-                && (to_land[1] - plan.jump_dir[1]).abs() < 1e-9
-        );
-        assert!(
-            nav.find_escape([30.0, 30.0, 0.0]).is_none(),
-            "already on the main area"
-        );
+        let to_land = unit([plan.land_xy[0] - plan.launch_xy[0], plan.land_xy[1] - plan.launch_xy[1]]).unwrap();
+        assert!((to_land[0] - plan.jump_dir[0]).abs() < 1e-9 && (to_land[1] - plan.jump_dir[1]).abs() < 1e-9);
+        assert!(nav.find_escape([30.0, 30.0, 0.0]).is_none(), "already on the main area");
         assert!(nav.find_escape([0.0, 0.0, 30.0]).is_none(), "airborne");
-        assert!(
-            nav.find_escape([-12.6, 0.0, 0.0]).is_none(),
-            "hugging the wall at ground level"
-        );
-        assert!(
-            nav.find_escape([-98.0, 0.0, 0.0]).is_none(),
-            "at the map edge"
-        );
+        assert!(nav.find_escape([-12.6, 0.0, 0.0]).is_none(), "hugging the wall at ground level");
+        assert!(nav.find_escape([-98.0, 0.0, 0.0]).is_none(), "at the map edge");
     }
 
     /// A 20 m courtyard walled in on all sides, `wall_h` meters tall.
@@ -1451,14 +1370,13 @@ mod tests {
             ([-14.0, -10.0], [-10.0, 10.0]),
             ([10.0, -10.0], [14.0, 10.0]),
         ] {
-            w.prisms
-                .push(Prism::rect(PrismKind::Building, a, b, 0.0, wall_h));
+            w.prisms.push(Prism::rect(PrismKind::Building, a, b, 0.0, wall_h));
         }
         nav_of(w)
     }
 
     #[test]
-    fn escape_rejects_cliffs() {
+    fn escape_rejects_cliffs_and_spares_big_basins() {
         // Low walls: hop over. Tall walls: out of jump reach, no plan.
         let low = courtyard(8.0);
         let me = [0.0, 0.0, 0.0];
@@ -1467,24 +1385,15 @@ mod tests {
         let plan = low.find_escape(me).expect("hop the low wall");
         assert!(low.is_main_xy(plan.land_xy[0], plan.land_xy[1]));
         assert!(plan.need_z <= 28.0 && dist_xy(plan.launch_xy, plan.land_xy) <= 30.0);
-        assert!(
-            courtyard(40.0).find_escape(me).is_none(),
-            "a 40 m wall is no jump"
-        );
+        assert!(courtyard(40.0).find_escape(me).is_none(), "a 40 m wall is no jump");
         // Paths stay inside the courtyard and end at its edge nearest the goal.
-        let path = low
-            .find_path([0.0, 0.0], [60.0, 0.0])
-            .expect("a path toward the goal");
+        let path = low.find_path([0.0, 0.0], [60.0, 0.0]).expect("a path toward the goal");
         let end = *path.last().unwrap();
         assert!(end[0] > 4.0, "ends at the near edge, got {end:?}");
         for w in path.windows(2) {
             assert!(low.walk_line_in(w[0], w[1], a));
         }
-        assert_eq!(
-            low.ground_area_of([0.0, 0.0, 9.0]),
-            None,
-            "on the roof is not the ground area"
-        );
+        assert_eq!(low.ground_area_of([0.0, 0.0, 9.0]), None, "on the roof is not the ground area");
     }
 
     #[test]
@@ -1501,23 +1410,14 @@ mod tests {
         let me = [-30.0, 0.0, 0.0];
         let mut exp_sum = 0.0;
         for _ in 0..10 {
-            let p = nav
-                .sample_home_spot(me, &zone, 0.6, 100.0, 40.0, &[], &[], &mut rng)
-                .unwrap();
+            let p = nav.sample_home_spot(me, &zone, 0.6, 100.0, 40.0, &[], &[], &mut rng).unwrap();
             assert!(nav.is_main_xy(p[0], p[1]));
             let r = dist_xy([p[0], p[1]], [0.0, 0.0]);
-            assert!(
-                (27.0 - 1e-9..=45.0 + 1e-9).contains(&r),
-                "hold distance {r}"
-            );
+            assert!(r <= 36.0 + 1e-9, "hold distance {r}");
             exp_sum += nav.exposure_at(p[0], p[1]);
         }
         let open = nav.exposure_at(-60.0, 80.0);
-        assert!(
-            exp_sum / 10.0 < open,
-            "mean exposure {} vs open {open}",
-            exp_sum / 10.0
-        );
+        assert!(exp_sum / 10.0 < open, "mean exposure {} vs open {open}", exp_sum / 10.0);
     }
 
     #[test]
@@ -1526,5 +1426,30 @@ mod tests {
         let b = ApexNav::shared("/nonexistent-arena-for-nav", &mech(), &VisionCfg::default());
         assert!(Arc::ptr_eq(&a, &b));
         assert!(a.world().prisms.is_empty() && a.is_main_xy(0.0, 0.0));
+    }
+
+    #[test]
+    fn two_stage_courtyard_escape_plans_roof_hop_then_main() {
+        // A courtyard enclosed by 24 m thick, 6 m tall buildings: too wide for any
+        // single ESCAPE_LAND hop to reach main directly, so it must stage via a roof.
+        let mut w = World::flat(100.0);
+        for (a, b) in [
+            ([-34.0, -34.0], [34.0, -10.0]),
+            ([-34.0, 10.0], [34.0, 34.0]),
+            ([-34.0, -10.0], [-10.0, 10.0]),
+            ([10.0, -10.0], [34.0, 10.0]),
+        ] {
+            w.prisms.push(Prism::rect(PrismKind::Building, a, b, 0.0, 6.0));
+        }
+        let nav = nav_of(w);
+        let me = [0.0, 0.0, 0.0];
+        let stage1 = nav.find_escape(me).expect("plans stage-1 roof hop out of wide courtyard");
+        assert!(!nav.is_main_xy(stage1.land_xy[0], stage1.land_xy[1]), "first hop lands on roof");
+        let z_land = nav.surface_at(stage1.land_xy[0], stage1.land_xy[1], f64::INFINITY);
+        assert!((z_land - 6.0).abs() < 1e-6, "lands on 6 m roof, got {z_land}");
+        let stage2 = nav
+            .find_escape([stage1.land_xy[0], stage1.land_xy[1], z_land])
+            .expect("plans stage-2 hop from roof to main");
+        assert!(nav.is_main_xy(stage2.land_xy[0], stage2.land_xy[1]), "second hop lands on main");
     }
 }

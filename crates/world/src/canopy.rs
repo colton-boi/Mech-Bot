@@ -59,10 +59,7 @@ impl Tree {
                 return false;
             }
             let root = disc.sqrt();
-            (
-                ((-qb - root) / (2.0 * qa)).max(0.0),
-                ((-qb + root) / (2.0 * qa)).min(1.0),
-            )
+            (((-qb - root) / (2.0 * qa)).max(0.0), ((-qb + root) / (2.0 * qa)).min(1.0))
         };
         if t0 > t1 {
             return false;
@@ -77,11 +74,7 @@ impl Tree {
         if half_h <= 0.0 || self.crown_r <= 0.0 {
             return 0.0;
         }
-        let center = [
-            self.crown_x,
-            self.crown_y,
-            self.z + self.crown_base + half_h,
-        ];
+        let center = [self.crown_x, self.crown_y, self.z + self.crown_base + half_h];
         let scale = [1.0 / self.crown_r, 1.0 / self.crown_r, 1.0 / half_h];
         let f: [f64; 3] = std::array::from_fn(|i| (a[i] - center[i]) * scale[i]);
         let d: [f64; 3] = std::array::from_fn(|i| (b[i] - a[i]) * scale[i]);
@@ -122,12 +115,7 @@ impl World {
         self.transmission_over(a, b, self.trees.iter())
     }
 
-    fn transmission_over<'t>(
-        &self,
-        a: Vec3,
-        b: Vec3,
-        trees: impl Iterator<Item = &'t Tree>,
-    ) -> f64 {
+    fn transmission_over<'t>(&self, a: Vec3, b: Vec3, trees: impl Iterator<Item = &'t Tree>) -> f64 {
         let mut foliage = 0.0;
         for tree in trees {
             let reach = crate::index::tree_reach(tree);

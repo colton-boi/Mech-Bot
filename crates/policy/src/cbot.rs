@@ -29,10 +29,7 @@
 use crate::nav::{Flow, MechDims, NavMap, NBR, NONE_TOP};
 use crate::pyrand::PyRandom;
 use crate::{Params, ParamsF64, Policy};
-use proto::{
-    Action, ActorKind, ActorObs, Config, DropObs, GameEvent, Hello, Obs, ProjectileKind, SelfObs,
-    SoundDist, SoundKind, WeaponKind, WeaponObs,
-};
+use proto::{Action, ActorKind, ActorObs, Config, DropObs, GameEvent, Hello, Obs, ProjectileKind, SelfObs, SoundDist, SoundKind, WeaponKind, WeaponObs};
 use std::f64::consts::PI;
 use std::sync::Arc;
 
@@ -119,9 +116,7 @@ impl Strategy {
     fn states(self) -> &'static [St] {
         use St::*;
         match self {
-            Strategy::Survive => &[
-                Escape, Dodge, Retreat, Break, Fight, Rotate, Drop, Loot, Farm, Hold,
-            ],
+            Strategy::Survive => &[Escape, Dodge, Retreat, Break, Fight, Rotate, Drop, Loot, Farm, Hold],
             Strategy::Hide => &[Escape, Dodge, Rotate, Hold],
             Strategy::Roof => &[Escape, Dodge, Climb, Perch, Rotate, Hold],
             Strategy::Aggro => &[Escape, Dodge, Break, Fight, Loot, Farm, Hunt, Rotate, Hold],
@@ -225,11 +220,7 @@ impl<'a> Ctx<'a> {
             vy: me.vel[1],
             hp_frac: me.hp / me.max_hp.max(1.0),
             muzzle: [x, y, z + me.stats.muzzle_height],
-            region: (
-                zone.next_center[0],
-                zone.next_center[1],
-                (zone.next_radius - margin).max(0.0),
-            ),
+            region: (zone.next_center[0], zone.next_center[1], (zone.next_radius - margin).max(0.0)),
             enemies,
             npcs,
             ground: nav.ground(x, y),
@@ -254,9 +245,7 @@ impl<'a> Ctx<'a> {
         let (cx, cy, r) = self.region;
         let out = (self.x + dx * ahead - cx).hypot(self.y + dy * ahead - cy) - r.max(10.0);
         let zone = &self.obs.zone;
-        let out_now = (self.x + dx * ahead - zone.center[0])
-            .hypot(self.y + dy * ahead - zone.center[1])
-            - zone.radius;
+        let out_now = (self.x + dx * ahead - zone.center[0]).hypot(self.y + dy * ahead - zone.center[1]) - zone.radius;
         0.03 * out.max(0.0) + 0.2 * (out_now + 15.0).max(0.0)
     }
 }
@@ -491,12 +480,7 @@ impl Cbot {
     // ================= memory =================
     fn remember(&mut self, c: &Ctx) {
         for ev in &c.obs.events {
-            if let GameEvent::Damaged {
-                bearing,
-                by: Some(by),
-                ..
-            } = ev
-            {
+            if let GameEvent::Damaged { bearing, by: Some(by), .. } = ev {
                 self.last_damage_t = c.t;
                 let mut b = *bearing;
                 for (_, m) in c.all_actors() {
@@ -592,12 +576,7 @@ impl Cbot {
     /// STRATEGY.md 2.1, the strong signal and the weak drift. GUESS: positive evidence
     /// only (an unexplained death), since squad signatures are not tracked yet.
     fn read_mode(&mut self, c: &Ctx) {
-        let ours = c
-            .obs
-            .events
-            .iter()
-            .filter(|e| matches!(e, GameEvent::Kill { target } if *target < 100))
-            .count() as u32;
+        let ours = c.obs.events.iter().filter(|e| matches!(e, GameEvent::Kill { target } if *target < 100)).count() as u32;
         self.kills += ours;
         let alive = c.obs.alive;
         if let Some(prev) = self.prev_alive {
@@ -620,14 +599,9 @@ impl Cbot {
         let ffa = self.mode_l >= p.ffa_threshold;
         self.passive = p.ffa_passive_on > 0.5 && ffa && c.t >= p.ffa_passive_from_t;
         self.practice = self.mode_l < p.practice_threshold && self.sig_seen;
-        self.final_ =
-            p.ffa_final_on > 0.5 && !self.practice && c.obs.zone.next_radius <= p.ffa_final_r;
+        self.final_ = p.ffa_final_on > 0.5 && !self.practice && c.obs.zone.next_radius <= p.ffa_final_r;
         let armed = c.me.weapons[1].is_some() || f64::from(c.me.cubes) >= p.early_cubes;
-        self.early = p.ffa_early_on > 0.5
-            && !self.practice
-            && !armed
-            && c.t < p.early_until_t
-            && !self.final_;
+        self.early = p.ffa_early_on > 0.5 && !self.practice && !armed && c.t < p.early_until_t && !self.final_;
     }
 
     /// Squad signatures A and B (STRATEGY.md 2.1), from unprovoked attackers only: a mech
@@ -690,11 +664,7 @@ impl Cbot {
             let a = &self.tracks[i];
             let to_me = a.dist(c.x, c.y);
             let ignores = self.tracks.iter().any(|m| {
-                m.id != a.id
-                    && m.seen_t == t
-                    && a.dist(m.pos[0], m.pos[1]) < to_me
-                    && !a.aims_at(m.pos[0], m.pos[1], tol)
-                    && c.nav.los(a.eye(), m.eye())
+                m.id != a.id && m.seen_t == t && a.dist(m.pos[0], m.pos[1]) < to_me && !a.aims_at(m.pos[0], m.pos[1], tol) && c.nav.los(a.eye(), m.eye())
             });
             let a = &mut self.tracks[i];
             if !ignores {
@@ -724,8 +694,7 @@ impl Cbot {
             return;
         }
         let p = &self.p;
-        let pressed = self.threat_recent(c, p.recover_quiet_s)
-            || c.enemies.iter().any(|(d, _)| *d < p.recover_clear_dist);
+        let pressed = self.threat_recent(c, p.recover_quiet_s) || c.enemies.iter().any(|(d, _)| *d < p.recover_clear_dist);
         if pressed || c.hp_frac >= p.recover_exit_frac {
             self.recovering = false;
         } else if c.hp_frac < p.recover_frac && !self.recovering {
@@ -767,10 +736,7 @@ impl Cbot {
     fn silent(&self, c: &Ctx) -> bool {
         let p = &self.p;
         p.silent_speed_frac > 0.0
-            && matches!(
-                self.state,
-                St::Rotate | St::Hold | St::Loot | St::Drop | St::Perch
-            )
+            && matches!(self.state, St::Rotate | St::Hold | St::Loot | St::Drop | St::Perch)
             && !self.zone_urgent(c)
             && self
                 .tracks
@@ -805,13 +771,7 @@ impl Cbot {
         }
     }
 
-    fn unstick(
-        &mut self,
-        c: &Ctx,
-        mv: (f64, f64),
-        boost: bool,
-        jump: bool,
-    ) -> ((f64, f64), bool, bool) {
+    fn unstick(&mut self, c: &Ctx, mv: (f64, f64), boost: bool, jump: bool) -> ((f64, f64), bool, bool) {
         let p = &self.p;
         let want = mv.0.hypot(mv.1) > 0.5;
         let speed = c.vx.hypot(c.vy);
@@ -843,11 +803,7 @@ impl Cbot {
         if self.flow.field_key == Some(Flow::key(nav, x, y, r)) {
             match self.flow.dir(nav, c.x, c.y) {
                 Some((0.0, 0.0)) => {
-                    return if (x - c.x).hypot(y - c.y) > r {
-                        unit(x - c.x, y - c.y)
-                    } else {
-                        (0.0, 0.0)
-                    };
+                    return if (x - c.x).hypot(y - c.y) > r { unit(x - c.x, y - c.y) } else { (0.0, 0.0) };
                 }
                 Some(d) => return d,
                 None => {
@@ -917,24 +873,13 @@ impl Cbot {
                 }
                 let cov = f64::from(w.cover[cc]);
                 let w_center = if self.early { 0.0 } else { p.spot_w_center };
-                let mut s = (x - c.x).hypot(y - c.y)
-                    + p.spot_w_cover * w.cs * (cov - 1.0).powi(2) * 0.5
-                    + w_center * dc;
+                let mut s = (x - c.x).hypot(y - c.y) + p.spot_w_cover * w.cs * (cov - 1.0).powi(2) * 0.5 + w_center * dc;
                 if corner {
                     let n = w.nw;
-                    let walls: u32 = [
-                        cc + 1,
-                        cc - 1,
-                        cc + n,
-                        cc - n,
-                        cc + n + 1,
-                        cc + n - 1,
-                        cc - n + 1,
-                        cc - n - 1,
-                    ]
-                    .iter()
-                    .map(|&o| u32::from(w.blocked[o]))
-                    .sum();
+                    let walls: u32 = [cc + 1, cc - 1, cc + n, cc - n, cc + n + 1, cc + n - 1, cc - n + 1, cc - n - 1]
+                        .iter()
+                        .map(|&o| u32::from(w.blocked[o]))
+                        .sum();
                     s -= 15.0 * f64::from(walls.min(4));
                 }
                 for t in &threats {
@@ -999,10 +944,7 @@ impl Cbot {
             if let Some(cell) = c.nav.nearest_free(x, y, 3).filter(|_| !c.nav.free(x, y)) {
                 (x, y) = c.nav.ncenter(cell);
             }
-            let watch = self
-                .watchers(c)
-                .first()
-                .map_or(c.me.aim[0], |e| (e[1] - y).atan2(e[0] - x));
+            let watch = self.watchers(c).first().map_or(c.me.aim[0], |e| (e[1] - y).atan2(e[0] - x));
             self.spot = Some((x, y, watch));
             self.spot_key = None;
             return (x, y, watch);
@@ -1010,10 +952,7 @@ impl Cbot {
         let (cx, cy, r) = c.region;
         let mut stale = match self.spot {
             None => true,
-            Some((x, y, _)) => {
-                self.spot_key != Some((pround(cx), pround(cy), pround(r)))
-                    || (x - cx).hypot(y - cy) > r.max(8.0)
-            }
+            Some((x, y, _)) => self.spot_key != Some((pround(cx), pround(cy), pround(r))) || (x - cx).hypot(y - cy) > r.max(8.0),
         };
         if !stale && self.conceal_w() > 0.0 && c.t >= self.spot_check_t {
             // at most once a second: leave a spot a remembered mech can see
@@ -1066,11 +1005,7 @@ impl Cbot {
             };
             match w.approach_point(&w.roofs[best], c.x, c.y) {
                 Some(ap) => {
-                    self.roof = Some(RoofSel {
-                        i: best,
-                        ap,
-                        key: c.region,
-                    });
+                    self.roof = Some(RoofSel { i: best, ap, key: c.region });
                     return;
                 }
                 None => self.roof_fail[best] = p.roof_max_tries,
@@ -1085,10 +1020,7 @@ impl Cbot {
     }
 
     fn roof_valid(&mut self, c: &Ctx) -> bool {
-        let moved = self
-            .roof
-            .as_ref()
-            .is_none_or(|rf| (rf.key.0, rf.key.1) != (c.region.0, c.region.1));
+        let moved = self.roof.as_ref().is_none_or(|rf| (rf.key.0, rf.key.1) != (c.region.0, c.region.1));
         if moved {
             let on_roof = self.on_roof(c);
             if let Some(roof) = self.roof.as_mut().filter(|_| on_roof) {
@@ -1132,18 +1064,11 @@ impl Cbot {
 
     fn want_retreat(&self, c: &Ctx) -> bool {
         let p = &self.p;
-        let window = if self.state == St::Retreat {
-            p.retreat_memory_s
-        } else {
-            p.threat_memory_s
-        };
+        let window = if self.state == St::Retreat { p.retreat_memory_s } else { p.threat_memory_s };
         if !self.threat_recent(c, window) {
             return false;
         }
-        if self
-            .attacker(c)
-            .is_some_and(|a| a.0 < p.retreat_gives_up_dist)
-        {
+        if self.attacker(c).is_some_and(|a| a.0 < p.retreat_gives_up_dist) {
             return false; // cornered: fight it out
         }
         if self.state == St::Retreat {
@@ -1166,10 +1091,7 @@ impl Cbot {
             .iter()
             .filter(|t| c.t - t.seen_t < p.break_hold_s.max(0.1) && t.dist(c.x, c.y) < p.fire_range)
             .count();
-        let on = seen as f64 >= p.exposed_break_n.round()
-            && !self
-                .attacker(c)
-                .is_some_and(|a| a.0 < p.retreat_gives_up_dist);
+        let on = seen as f64 >= p.exposed_break_n.round() && !self.attacker(c).is_some_and(|a| a.0 < p.retreat_gives_up_dist);
         if !on {
             self.break_spot = None;
         }
@@ -1200,15 +1122,11 @@ impl Cbot {
                 }
                 let (x, y) = w.ncenter(cc);
                 let d = (x - c.x).hypot(y - c.y);
-                if d > p.break_search_r
-                    || (x - zone.center[0]).hypot(y - zone.center[1]) > zone.radius - 5.0
-                {
+                if d > p.break_search_r || (x - zone.center[0]).hypot(y - zone.center[1]) > zone.radius - 5.0 {
                     continue;
                 }
                 let cov = f64::from(w.cover[cc]);
-                let s = d
-                    + p.spot_w_cover * w.cs * (cov - 1.0).powi(2) * 0.5
-                    + 0.03 * c.dist_region_at(x, y).max(0.0);
+                let s = d + p.spot_w_cover * w.cs * (cov - 1.0).powi(2) * 0.5 + 0.03 * c.dist_region_at(x, y).max(0.0);
                 cands.push((s, x, y));
             }
         }
@@ -1230,9 +1148,10 @@ impl Cbot {
             return false;
         }
         !self.early
-            || !c.enemies.iter().any(|(_, o)| {
-                o.id != m.id && (o.pos[0] - m.pos[0]).hypot(o.pos[1] - m.pos[1]) < self.p.isolated_r
-            })
+            || !c
+                .enemies
+                .iter()
+                .any(|(_, o)| o.id != m.id && (o.pos[0] - m.pos[0]).hypot(o.pos[1] - m.pos[1]) < self.p.isolated_r)
     }
 
     /// In the free-for-all final, a mech worth shooting without being attacked: shown HP under `finish_hp`.
@@ -1248,16 +1167,9 @@ impl Cbot {
             return Some(att);
         }
         if self.final_ || self.early {
-            return c
-                .enemies
-                .iter()
-                .find(|(d, m)| *d < self.p.fire_range && self.worth_it(c, m))
-                .copied();
+            return c.enemies.iter().find(|(d, m)| *d < self.p.fire_range && self.worth_it(c, m)).copied();
         }
-        c.enemies
-            .iter()
-            .find(|(d, _)| *d < self.p.engage_range || self.aggro())
-            .copied()
+        c.enemies.iter().find(|(d, _)| *d < self.p.engage_range || self.aggro()).copied()
     }
 
     fn drop_target<'a>(&self, c: &Ctx<'a>) -> Option<&'a DropObs> {
@@ -1277,9 +1189,7 @@ impl Cbot {
             if dist / c.me.stats.walk_speed + 3.0 < d.lands_in {
                 return false;
             }
-            !c.enemies
-                .iter()
-                .any(|(_, m)| (m.pos[0] - x).hypot(m.pos[1] - y) < p.drop_enemy_clear)
+            !c.enemies.iter().any(|(_, m)| (m.pos[0] - x).hypot(m.pos[1] - y) < p.drop_enemy_clear)
         })
     }
 
@@ -1311,11 +1221,7 @@ impl Cbot {
 
     fn farm_target<'a>(&self, c: &Ctx<'a>) -> Option<Target<'a>> {
         let p = &self.p;
-        if self.recovering
-            || c.hp_frac < p.farm_min_hp
-            || c.t > p.farm_until_t
-            || c.t - self.last_enemy_t < p.quiet_s
-        {
+        if self.recovering || c.hp_frac < p.farm_min_hp || c.t > p.farm_until_t || c.t - self.last_enemy_t < p.quiet_s {
             return None;
         }
         c.npcs.iter().find(|(d, _)| *d < p.farm_range).copied()
@@ -1355,11 +1261,7 @@ impl Cbot {
                     let sign = f64::from(self.strafe_sign);
                     ((b + PI / 2.0).cos() * sign, (b + PI / 2.0).sin() * sign)
                 };
-                let mv = best_heading(
-                    c,
-                    |dx, dy| dx * ax + dy * ay - c.region_penalty(dx, dy),
-                    8.0,
-                );
+                let mv = best_heading(c, |dx, dy| dx * ax + dy * ay - c.region_penalty(dx, dy), 8.0);
                 (mv, true, false, self.threat_look(c, aim0))
             }
             St::Retreat => {
@@ -1370,11 +1272,7 @@ impl Cbot {
                     c,
                     |dx, dy| {
                         let nc = w.ncell(c.x + dx * 12.0, c.y + dy * 12.0);
-                        let cov = if nc >= 0 {
-                            f64::from(w.cover[nc as usize])
-                        } else {
-                            15.0
-                        };
+                        let cov = if nc >= 0 { f64::from(w.cover[nc as usize]) } else { 15.0 };
                         dx * ax + dy * ay + 0.08 * (3.0 - cov.min(6.0)) - c.region_penalty(dx, dy)
                     },
                     10.0,
@@ -1385,20 +1283,9 @@ impl Cbot {
             St::Break => {
                 let (x, y) = self.ensure_break_spot(c);
                 let d = (x - c.x).hypot(y - c.y);
-                let mv = if d < 2.0 {
-                    (0.0, 0.0)
-                } else {
-                    self.go(c, x, y, 2.0)
-                };
-                let near = c.enemies.first().map_or(heading_or(mv, aim0), |(_, m)| {
-                    (m.pos[1] - c.y).atan2(m.pos[0] - c.x)
-                });
-                (
-                    mv,
-                    d > 10.0 && energy > 30.0,
-                    false,
-                    self.threat_look(c, near),
-                )
+                let mv = if d < 2.0 { (0.0, 0.0) } else { self.go(c, x, y, 2.0) };
+                let near = c.enemies.first().map_or(heading_or(mv, aim0), |(_, m)| (m.pos[1] - c.y).atan2(m.pos[0] - c.x));
+                (mv, d > 10.0 && energy > 30.0, false, self.threat_look(c, near))
             }
             St::Rotate => self.do_rotate(c),
             St::Hold => {
@@ -1408,43 +1295,20 @@ impl Cbot {
                     // GUESS: full speed until 6 m out, then proportional, stopping within 0.5 m
                     let (ux, uy) = unit(x - c.x, y - c.y);
                     let k = if d < 0.5 { 0.0 } else { (d / 6.0).min(1.0) };
-                    return (
-                        (ux * k, uy * k),
-                        false,
-                        false,
-                        self.threat_look(c, self.watch_yaw(c, watch)),
-                    );
+                    return ((ux * k, uy * k), false, false, self.threat_look(c, self.watch_yaw(c, watch)));
                 }
-                let mut mv = if d < 2.0 {
-                    (0.0, 0.0)
-                } else {
-                    self.go(c, x, y, 2.0)
-                };
+                let mut mv = if d < 2.0 { (0.0, 0.0) } else { self.go(c, x, y, 2.0) };
                 if d < 4.0 {
                     mv = (mv.0 * 0.3, mv.1 * 0.3); // under step_speed: silent
                 }
-                (
-                    mv,
-                    false,
-                    false,
-                    self.threat_look(c, self.watch_yaw(c, watch)),
-                )
+                (mv, false, false, self.threat_look(c, self.watch_yaw(c, watch)))
             }
             St::Drop => {
                 let d = self.drop_target(c).expect("drop needs a target");
                 let (x, y) = (d.pos[0], d.pos[1]);
                 let dist = (x - c.x).hypot(y - c.y);
-                let mv = if dist < d.radius * 0.5 {
-                    (0.0, 0.0)
-                } else {
-                    self.go(c, x, y, 2.0)
-                };
-                (
-                    mv,
-                    dist > 40.0 && energy > 60.0,
-                    false,
-                    self.threat_look(c, self.watch_yaw(c, aim0)),
-                )
+                let mv = if dist < d.radius * 0.5 { (0.0, 0.0) } else { self.go(c, x, y, 2.0) };
+                (mv, dist > 40.0 && energy > 60.0, false, self.threat_look(c, self.watch_yaw(c, aim0)))
             }
             St::Loot => {
                 let [x, y, _] = self.loot_target(c).expect("loot needs a target");
@@ -1458,30 +1322,17 @@ impl Cbot {
             St::Farm => {
                 let (d, m) = self.farm_target(c).expect("farm needs a target");
                 let b = (m.pos[1] - c.y).atan2(m.pos[0] - c.x);
-                let mv = if d > 60.0 {
-                    self.go(c, m.pos[0], m.pos[1], 50.0)
-                } else {
-                    (0.0, 0.0)
-                };
+                let mv = if d > 60.0 { self.go(c, m.pos[0], m.pos[1], 50.0) } else { (0.0, 0.0) };
                 (mv, false, false, b)
             }
             St::Hunt => {
                 if let Some((_, m)) = c.enemies.first() {
                     let (gx, gy) = (snap20(m.pos[0]), snap20(m.pos[1]));
                     let mv = self.go(c, gx, gy, 20.0);
-                    return (
-                        mv,
-                        energy > 60.0,
-                        false,
-                        (m.pos[1] - c.y).atan2(m.pos[0] - c.x),
-                    );
+                    return (mv, energy > 60.0, false, (m.pos[1] - c.y).atan2(m.pos[0] - c.x));
                 }
                 if let Some((b, _)) = self.alert.filter(|a| c.t - a.1 < 8.0) {
-                    let mv = best_heading(
-                        c,
-                        |dx, dy| dx * b.cos() + dy * b.sin() - c.region_penalty(dx, dy),
-                        10.0,
-                    );
+                    let mv = best_heading(c, |dx, dy| dx * b.cos() + dy * b.sin() - c.region_penalty(dx, dy), 10.0);
                     return (mv, false, false, b);
                 }
                 self.do_rotate(c)
@@ -1490,21 +1341,12 @@ impl Cbot {
             St::Perch => {
                 let (tx, ty) = c.nav.roofs[self.roof.as_ref().expect("perch needs a roof").i].c;
                 let d = (tx - c.x).hypot(ty - c.y);
-                let mut mv = if d < 3.0 {
-                    (0.0, 0.0)
-                } else {
-                    unit(tx - c.x, ty - c.y)
-                };
+                let mut mv = if d < 3.0 { (0.0, 0.0) } else { unit(tx - c.x, ty - c.y) };
                 if d < 6.0 {
                     mv = (mv.0 * 0.3, mv.1 * 0.3);
                 }
                 let (cx, cy, _) = c.region;
-                (
-                    mv,
-                    false,
-                    false,
-                    self.threat_look(c, self.watch_yaw(c, (c.y - cy).atan2(c.x - cx))),
-                )
+                (mv, false, false, self.threat_look(c, self.watch_yaw(c, (c.y - cy).atan2(c.x - cx))))
             }
         }
     }
@@ -1520,19 +1362,13 @@ impl Cbot {
         let (px, py) = (-by * sign, bx * sign);
         let aggro = self.aggro();
         let (mut lo, mut hi) = (self.p.fight_min_dist, self.p.fight_max_dist);
-        if m.weapons
-            .as_ref()
-            .is_some_and(|w| w.contains(&WeaponKind::Lightning))
-        {
+        if m.weapons.as_ref().is_some_and(|w| w.contains(&WeaponKind::Lightning)) {
             lo = lo.max(self.p.lightning_keep_away);
         }
         if aggro {
             (lo, hi) = (10.0, self.p.aggro_close_dist);
             let held = |k: WeaponKind| c.me.weapons.iter().flatten().any(|w| w.kind() == k);
-            if self.p.range_by_loadout_on > 0.5
-                && !held(WeaponKind::Lightning)
-                && !held(WeaponKind::Mortar)
-            {
+            if self.p.range_by_loadout_on > 0.5 && !held(WeaponKind::Lightning) && !held(WeaponKind::Mortar) {
                 (lo, hi) = if held(WeaponKind::Laser) {
                     (self.p.aggro_laser_min, self.p.aggro_laser_max)
                 } else {
@@ -1552,11 +1388,7 @@ impl Cbot {
             return (mv, c.me.energy > self.p.chase_boost_energy, false, look);
         }
         let (gx, gy) = (px + radial * bx, py + radial * by);
-        let mv = best_heading(
-            c,
-            |dx, dy| dx * gx + dy * gy - c.region_penalty(dx, dy),
-            8.0,
-        );
+        let mv = best_heading(c, |dx, dy| dx * gx + dy * gy - c.region_penalty(dx, dy), 8.0);
         (mv, false, false, look)
     }
 
@@ -1586,11 +1418,7 @@ impl Cbot {
                 self.climb_marked = true;
                 self.climb_failed();
             }
-            let mv = if clear || near_wall {
-                mv
-            } else {
-                unit(ex - c.x, ey - c.y)
-            };
+            let mv = if clear || near_wall { mv } else { unit(ex - c.x, ey - c.y) };
             return (mv, !clear, false, to_center);
         }
         self.climb_marked = false;
@@ -1599,12 +1427,7 @@ impl Cbot {
             return (mv, false, false, self.threat_look(c, heading_or(mv, 0.0)));
         }
         if c.me.energy < need {
-            return (
-                (0.0, 0.0),
-                false,
-                false,
-                self.threat_look(c, (qy - ty).atan2(qx - tx)),
-            );
+            return ((0.0, 0.0), false, false, self.threat_look(c, (qy - ty).atan2(qx - tx)));
         }
         (unit(ex - c.x, ey - c.y), true, true, to_center)
     }
@@ -1624,11 +1447,7 @@ impl Cbot {
         if self.recovering {
             return None;
         }
-        let mode = if self.passive {
-            FireMode::Engaged
-        } else {
-            self.strategy.fire()
-        };
+        let mode = if self.passive { FireMode::Engaged } else { self.strategy.fire() };
         let attacked = self.threat_recent(c, p.threat_memory_s);
         if mode == FireMode::Attacked && !attacked {
             return None;
@@ -1641,11 +1460,7 @@ impl Cbot {
         if let Some(a) = att {
             cands.push(a);
         }
-        cands.extend(
-            c.enemies
-                .iter()
-                .filter(|e| att.is_none_or(|a| e.1.id != a.1.id)),
-        );
+        cands.extend(c.enemies.iter().filter(|e| att.is_none_or(|a| e.1.id != a.1.id)));
         if self.state == St::Farm {
             if let Some(ft) = self.farm_target(c) {
                 cands.insert(0, ft);
@@ -1659,13 +1474,7 @@ impl Cbot {
                 };
                 let to_me = (c.y - m.pos[1]).atan2(c.x - m.pos[0]);
                 let facing = wrap(m.aim[0] - to_me).abs() < p.aim_at_me_rad;
-                p.w_dist * d / 100.0 + p.w_hp * hp
-                    - if self.last_target == Some(m.id) {
-                        p.w_sticky
-                    } else {
-                        0.0
-                    }
-                    - if facing { p.w_facing } else { 0.0 }
+                p.w_dist * d / 100.0 + p.w_hp * hp - if self.last_target == Some(m.id) { p.w_sticky } else { 0.0 } - if facing { p.w_facing } else { 0.0 }
             };
             cands.sort_by(|a, b| score(a).total_cmp(&score(b)));
         }
@@ -1674,17 +1483,10 @@ impl Cbot {
             if d > p.fire_range {
                 continue;
             }
-            if (self.final_ || self.early)
-                && !att.is_some_and(|a| a.1.id == m.id)
-                && !self.worth_it(c, m)
-            {
+            if (self.final_ || self.early) && !att.is_some_and(|a| a.1.id == m.id) && !self.worth_it(c, m) {
                 continue;
             }
-            if mode == FireMode::Engaged
-                && m.kind == ActorKind::Mech
-                && !att.is_some_and(|a| a.1.id == m.id)
-                && !matches!(self.state, St::Fight | St::Farm)
-            {
+            if mode == FireMode::Engaged && m.kind == ActorKind::Mech && !att.is_some_and(|a| a.1.id == m.id) && !matches!(self.state, St::Fight | St::Farm) {
                 let to_me = (c.y - m.pos[1]).atan2(c.x - m.pos[0]);
                 if d > p.engage_range && wrap(m.aim[0] - to_me).abs() > p.aim_at_me_rad {
                     continue;
@@ -1694,11 +1496,7 @@ impl Cbot {
                 break;
             }
             checks += 1.0;
-            let center = [
-                m.pos[0],
-                m.pos[1],
-                m.pos[2] + if m.kind == ActorKind::Mech { 4.5 } else { 1.75 },
-            ];
+            let center = [m.pos[0], m.pos[1], m.pos[2] + if m.kind == ActorKind::Mech { 4.5 } else { 1.75 }];
             if c.nav.los(c.muzzle, center) {
                 return Some((d, m, center));
             }
@@ -1720,25 +1518,15 @@ impl Cbot {
         let (mut aim_yaw, mut aim_pitch) = (look, 0.0);
         let mut fire = [false, false];
         let weapons = &c.me.weapons;
-        let slot_of = |kind: WeaponKind| {
-            weapons
-                .iter()
-                .rposition(|w| w.as_ref().is_some_and(|w| w.kind() == kind))
-        };
-        let laser_slot = weapons
-            .iter()
-            .position(|w| w.as_ref().is_some_and(|w| w.kind() == WeaponKind::Laser));
+        let slot_of = |kind: WeaponKind| weapons.iter().rposition(|w| w.as_ref().is_some_and(|w| w.kind() == kind));
+        let laser_slot = weapons.iter().position(|w| w.as_ref().is_some_and(|w| w.kind() == WeaponKind::Laser));
         if let Some((d, m, center)) = self.pick_target(c) {
             target_id = Some(m.id);
             let [mx, my, mz] = c.muzzle;
             if let Some(ms) = slot_of(WeaponKind::Mortar) {
                 if let Some(WeaponObs::Mortar { cooldown, stats }) = &weapons[ms] {
-                    let ready =
-                        *cooldown <= 0.05 && p.mortar_min_range < d && d < p.mortar_max_range;
-                    if let Some((yaw, pitch)) = ready
-                        .then(|| self.mortar_solution(c, stats.speed, stats.gravity, m))
-                        .flatten()
-                    {
+                    let ready = *cooldown <= 0.05 && p.mortar_min_range < d && d < p.mortar_max_range;
+                    if let Some((yaw, pitch)) = ready.then(|| self.mortar_solution(c, stats.speed, stats.gravity, m)).flatten() {
                         if aimed(c, yaw, pitch, 0.03) {
                             fire[ms] = true;
                         }
@@ -1757,11 +1545,7 @@ impl Cbot {
             let (mut ax, mut ay, mut az) = (px, py, pz);
             for _ in 0..2 {
                 let lead = tt + p.lead_lag_s;
-                (ax, ay, az) = (
-                    px + vx * lead,
-                    py + vy * lead,
-                    pz + vz * lead * p.lead_vz_frac,
-                );
+                (ax, ay, az) = (px + vx * lead, py + vy * lead, pz + vz * lead * p.lead_vz_frac);
                 tt = ((ax - mx).powi(2) + (ay - my).powi(2) + (az - mz).powi(2)).sqrt() / speed;
             }
             aim_yaw = (ay - my).atan2(ax - mx);
@@ -1778,43 +1562,22 @@ impl Cbot {
             }
             let settled = p.slew_gate <= 0.5 || self.last_on == Some(m.id);
             if let Some(g) = gun {
-                if let Some(WeaponObs::Gun {
-                    ammo,
-                    reload,
-                    stats,
-                    ..
-                }) = &weapons[g]
-                {
+                if let Some(WeaponObs::Gun { ammo, reload, stats, .. }) = &weapons[g] {
                     if on && settled && *ammo > 0.0 && *reload <= 0.0 && d < stats.range {
                         fire[g] = true;
                     }
                 }
             }
-            if let Some((lt, Some(WeaponObs::Lightning { stats, .. }))) =
-                slot_of(WeaponKind::Lightning).map(|i| (i, &weapons[i]))
-            {
+            if let Some((lt, Some(WeaponObs::Lightning { stats, .. }))) = slot_of(WeaponKind::Lightning).map(|i| (i, &weapons[i])) {
                 let direct = (py - my).atan2(px - mx);
-                if d < stats.range * 0.95
-                    && wrap(c.me.aim[0] - direct).abs() < stats.cone_deg.to_radians() * 0.4
-                    && c.me.energy > 10.0
-                {
+                if d < stats.range * 0.95 && wrap(c.me.aim[0] - direct).abs() < stats.cone_deg.to_radians() * 0.4 && c.me.energy > 10.0 {
                     fire[lt] = true;
                 }
             }
-            if let Some((
-                ls,
-                Some(WeaponObs::Laser {
-                    cooldown,
-                    charge,
-                    stats,
-                }),
-            )) = laser_slot.map(|i| (i, &weapons[i]))
-            {
+            if let Some((ls, Some(WeaponObs::Laser { cooldown, charge, stats }))) = laser_slot.map(|i| (i, &weapons[i])) {
                 let direct_yaw = (py - my).atan2(px - mx);
                 let direct_pitch = (pz - mz).atan2((px - mx).hypot(py - my));
-                let finish = p.laser_finish_hp > 0.0
-                    && m.hp.is_some_and(|hp| hp < p.laser_finish_hp)
-                    && *charge >= stats.min_charge * 1.05;
+                let finish = p.laser_finish_hp > 0.0 && m.hp.is_some_and(|hp| hp < p.laser_finish_hp) && *charge >= stats.min_charge * 1.05;
                 let charged = *charge >= stats.charge * 0.95 || finish;
                 if *charge > 0.0 || *cooldown <= 0.0 {
                     (aim_yaw, aim_pitch) = (direct_yaw, direct_pitch);
@@ -1871,10 +1634,7 @@ impl Cbot {
         let reach = self.cfg.loot.pickup_radius;
         let weapons = &c.me.weapons;
         for pk in &c.obs.pickups {
-            if (pk.pos[0] - c.x).hypot(pk.pos[1] - c.y) < reach
-                && (pk.pos[2] - c.z).abs() < 4.0
-                && wanted_weapon(pk.kind, c.me, self.p.no_mortar > 0.5)
-            {
+            if (pk.pos[0] - c.x).hypot(pk.pos[1] - c.y) < reach && (pk.pos[2] - c.z).abs() < 4.0 && wanted_weapon(pk.kind, c.me, self.p.no_mortar > 0.5) {
                 act.take = Some(pk.id);
                 if let Some(s1) = &weapons[1] {
                     if matches!(s1, WeaponObs::Laser { charge, .. } if *charge > 0.0) {
@@ -1886,13 +1646,7 @@ impl Cbot {
                 break;
             }
         }
-        if let Some(WeaponObs::Gun {
-            ammo,
-            reload,
-            stats,
-            ..
-        }) = &weapons[0]
-        {
+        if let Some(WeaponObs::Gun { ammo, reload, stats, .. }) = &weapons[0] {
             if !act.fire[0] && *reload <= 0.0 && *ammo < stats.mag * 0.5 && c.enemies.is_empty() {
                 act.reload = true;
             }
@@ -1922,21 +1676,13 @@ fn wanted_weapon(kind: WeaponKind, me: &SelfObs, no_mortar: bool) -> bool {
     }
     match &me.weapons[1] {
         None => true,
-        Some(s1) => pref
-            .iter()
-            .position(|k| *k == s1.kind())
-            .is_some_and(|r1| rank < r1),
+        Some(s1) => pref.iter().position(|k| *k == s1.kind()).is_some_and(|r1| rank < r1),
     }
 }
 
 /// The spot of lowest score plus `w` per watcher that can see it, among the
 /// [`CONCEAL_TESTS`] best by score alone (ties keep the earlier candidate).
-fn concealed_best(
-    c: &Ctx,
-    mut cands: Vec<(f64, f64, f64)>,
-    watchers: &[[f64; 3]],
-    w: f64,
-) -> Option<(f64, f64)> {
+fn concealed_best(c: &Ctx, mut cands: Vec<(f64, f64, f64)>, watchers: &[[f64; 3]], w: f64) -> Option<(f64, f64)> {
     if watchers.is_empty() {
         return None;
     }
@@ -2027,8 +1773,7 @@ impl Policy for Cbot {
         let (mut mv, mut boost, mut jump, look) = self.handle(self.state, &c);
         let silent = self.silent(&c);
         if silent {
-            let cap = self.p.silent_speed_frac * self.cfg.sound.step_speed
-                / c.me.stats.walk_speed.max(1e-3);
+            let cap = self.p.silent_speed_frac * self.cfg.sound.step_speed / c.me.stats.walk_speed.max(1e-3);
             let len = mv.0.hypot(mv.1);
             if len > cap {
                 mv = (mv.0 * cap / len, mv.1 * cap / len);
@@ -2036,8 +1781,7 @@ impl Policy for Cbot {
             (boost, jump) = (false, false);
         }
         if self.jet_hint && !silent {
-            if c.me.grounded && c.me.energy > 60.0 && !nav.clear_ray(c.x, c.y, mv.0, mv.1, 6.0, 2.0)
-            {
+            if c.me.grounded && c.me.energy > 60.0 && !nav.clear_ray(c.x, c.y, mv.0, mv.1, 6.0, 2.0) {
                 jump = true;
                 boost = true;
             } else if !c.me.grounded && c.me.energy > 3.0 {
@@ -2056,12 +1800,7 @@ impl Policy for Cbot {
         self.flow.pump(&nav, self.p.flow_pops.max(1.0) as u64);
         if self.debug {
             act.debug = Some(proto::DebugDraw {
-                label: Some(format!(
-                    "{}:{} hp{:.2}",
-                    self.strategy.name(),
-                    self.state_name(),
-                    c.hp_frac
-                )),
+                label: Some(format!("{}:{} hp{:.2}", self.strategy.name(), self.state_name(), c.hp_frac)),
                 ..Default::default()
             });
         }

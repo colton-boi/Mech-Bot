@@ -10,12 +10,12 @@ use std::collections::{BTreeMap, VecDeque};
 use std::f64::consts::PI;
 
 use proto::{
-    ActorKind, ActorObs, BeamObs, Config, DamageKind, GameEvent, Obs, SoundDist, SoundKind,
-    TakeFailReason, WeaponKind, WeaponObs, WeaponsCfg,
+    ActorKind, ActorObs, BeamKind, BeamObs, Config, DamageKind, GameEvent, Obs, SoundDist, SoundKind, TakeFailReason, VisionCfg, WeaponKind, WeaponObs,
+    WeaponsCfg,
 };
 use world::World;
 
-use super::types::{clamp, dist2d, dist3d, dist_xy, wrap_pi, ItemKind, Rng64, ThreatInfo};
+use super::types::{clamp, dist2d, dist3d, wrap_pi, ItemKind, Rng64, ThreatInfo};
 
 /// Mech ids are below this; NPCs, crates, cubes, and pickups are above.
 const MECH_ID_LIMIT: u32 = 16;
@@ -66,19 +66,26 @@ const FFA_LATCH_TICKS: u32 = 3;
 /// Third-party beam hits needed, and their minimum spacing in seconds.
 const FFA_BEAM_HITS: usize = 2;
 const FFA_BEAM_SPACING: f64 = 1.0;
-/// HP an enemy may miss beyond what we dealt before it proves a third party.
-const FFA_MISSING_HP: f64 = 300.0;
-/// Foreign-death thresholds: `(deaths, by time)`.
-const FFA_DEATHS_EARLY: (u32, f64) = (2, 45.0);
-const FFA_DEATHS_LATE: (u32, f64) = (4, 75.0);
-/// Zone dps at or above which deaths may be the zone's doing.
-const FFA_ZONE_DPS: f64 = 100.0;
+/// Foreign-death thresholds: `(deaths, highest zone dps)`. Deaths under a
+/// harmless zone are someone else's kills.
+const FFA_DEATHS_CALM: (u32, f64) = (2, 35.0);
+const FFA_DEATHS_ANY: (u32, f64) = (3, 100.0);
+/// A third-party beam ends farther than this from us, meters.
+const FFA_BEAM_FAR_FROM_US: f64 = 20.0;
+/// A third-party beam ends farther than this from any NPC or crate, meters.
+const FFA_BEAM_FAR_FROM_PVE: f64 = 12.0;
+/// A beam end within this horizontal distance of a mech hits it, meters.
+const FFA_BEAM_HIT_R: f64 = 4.5;
+/// A beam end this far below the feet or above the head still hits, meters.
+const FFA_BEAM_HIT_Z: f64 = 2.5;
+/// The struck mech must have been seen within this many seconds of the beam.
+const FFA_BEAM_SEEN_S: f64 = 1.5;
+/// Margin inside the vision ranges, meters, and yaw wedge, radians, before an
+/// unseen item counts as gone.
+const SEE_RANGE_MARGIN: f64 = 8.0;
+const SEE_FOV_MARGIN: f64 = 0.08;
 /// A visible mech this close in yaw to our aim is what an ammo drop was fired at.
 const FIRE_AIM_TOL: f64 = 0.3;
-/// A beam end this close (horizontally, beyond the mech radius) hits a mech.
-const BEAM_HIT_SLACK: f64 = 2.5;
-/// A beam ending this close to us (beyond the mech radius) was aimed at us.
-const BEAM_NEAR_US: f64 = 6.0;
 /// Enemy aim within this many radians of us counts as aware.
 const AWARE_AIM_TOL: f64 = 0.3;
 /// Seconds after hitting us that an enemy still counts as aware.
@@ -147,19 +154,14 @@ impl HitBandit {
     }
 
     fn choose(&self, rng: &mut Rng64) -> usize {
-        if let Some(i) = (0..3)
-            .filter(|&i| self.shots[i] < BANDIT_MIN_SHOTS)
-            .min_by_key(|&i| (self.shots[i], i))
-        {
+        if let Some(i) = (0..3).filter(|&i| self.shots[i] < BANDIT_MIN_SHOTS).min_by_key(|&i| (self.shots[i], i)) {
             return i;
         }
         if rng.chance(BANDIT_EXPLORE) {
             return (rng.next_u64() % 3) as usize;
         }
         // Hits can trail an arm switch, so never credit more hits than shots.
-        let rate = |i: usize| {
-            (f64::from(self.hits[i].min(self.shots[i])) + 1.0) / (f64::from(self.shots[i]) + 4.0)
-        };
+        let rate = |i: usize| (f64::from(self.hits[i].min(self.shots[i])) + 1.0) / (f64::from(self.shots[i]) + 4.0);
         let mut best = 0;
         for i in 1..3 {
             if rate(i) > rate(best) {
@@ -171,12 +173,7 @@ impl HitBandit {
 
     /// Counts drops in gun ammo since the last update as shots when `at_mech`.
     /// Returns the number of shots counted.
-    fn observe_ammo(
-        &mut self,
-        weapons: &[Option<WeaponObs>; 2],
-        at_mech: bool,
-        rng: &mut Rng64,
-    ) -> u32 {
+    fn observe_ammo(&mut self, weapons: &[Option<WeaponObs>; 2], at_mech: bool, rng: &mut Rng64) -> u32 {
         let now = weapons.iter().enumerate().find_map(|(slot, w)| match w {
             Some(WeaponObs::Gun { ammo, .. }) => Some((slot, *ammo)),
             _ => None,
@@ -309,12 +306,12 @@ struct HeardSound {
 pub struct BotMemory {
     slot: u32,
     mech_count: u32,
-    mech_radius: f64,
     mech_height: f64,
     eye_height: f64,
     muzzle_height: f64,
     mech_hp: f64,
     weapons_cfg: WeaponsCfg,
+    vision: VisionCfg,
     tracks: BTreeMap<u32, MechTrack>,
     ledger: BTreeMap<u32, Ledger>,
     npcs: BTreeMap<u32, NpcTrack>,
@@ -332,6 +329,7 @@ pub struct BotMemory {
     last_kill_pos: Option<[f64; 3]>,
     my_kills: u32,
     third_party_beam_ts: Vec<f64>,
+    start_alive: Option<u32>,
     ffa_streak: u32,
     ffa_detected: bool,
 }
@@ -342,12 +340,12 @@ impl BotMemory {
         Self {
             slot,
             mech_count: cfg.match_.mechs.max(0.0) as u32,
-            mech_radius: cfg.mech.radius,
             mech_height: cfg.mech.height,
             eye_height: cfg.mech.eye_height,
             muzzle_height: cfg.mech.muzzle_height,
             mech_hp: cfg.mech.hp,
             weapons_cfg: cfg.weapons.clone(),
+            vision: cfg.vision.clone(),
             tracks: BTreeMap::new(),
             ledger: BTreeMap::new(),
             npcs: BTreeMap::new(),
@@ -365,6 +363,7 @@ impl BotMemory {
             last_kill_pos: None,
             my_kills: 0,
             third_party_beam_ts: Vec::new(),
+            start_alive: None,
             ffa_streak: 0,
             ffa_detected: false,
         }
@@ -394,8 +393,7 @@ impl BotMemory {
         self.update_actors(obs);
         self.update_beams(obs);
         self.update_events(obs);
-        self.tracks
-            .retain(|_, tr| t - tr.last_seen_t <= MECH_TRACK_TTL);
+        self.tracks.retain(|_, tr| t - tr.last_seen_t <= MECH_TRACK_TTL);
         self.npcs.retain(|_, n| t - n.last_seen_t <= NPC_TRACK_TTL);
         if self.ghost.is_some_and(|g| t - g.t > GHOST_TTL) {
             self.ghost = None;
@@ -435,10 +433,7 @@ impl BotMemory {
     }
 
     fn see_mech(&mut self, a: &ActorObs, t: f64) {
-        let tr = self
-            .tracks
-            .entry(a.id)
-            .or_insert_with(|| MechTrack::new(a.pos, t));
+        let tr = self.tracks.entry(a.id).or_insert_with(|| MechTrack::new(a.pos, t));
         tr.pos = a.pos;
         tr.vel = a.vel;
         tr.aim = a.aim;
@@ -454,11 +449,7 @@ impl BotMemory {
         tr.last_seen_t = t;
         tr.visible_now = true;
         tr.vel_hist.push_back((t, a.vel));
-        while tr
-            .vel_hist
-            .front()
-            .is_some_and(|&(ts, _)| t - ts > VEL_WINDOW + 1e-9)
-        {
+        while tr.vel_hist.front().is_some_and(|&(ts, _)| t - ts > VEL_WINDOW + 1e-9) {
             tr.vel_hist.pop_front();
         }
         tr.accel = lead2_accel(&tr.vel_hist, t, a.vel);
@@ -486,32 +477,68 @@ impl BotMemory {
                     Some(_) => {}
                 }
             }
-            if self.is_third_party_hit(b, bt, obs)
-                && self
-                    .third_party_beam_ts
-                    .iter()
-                    .all(|&ts| (ts - bt).abs() > FFA_BEAM_SPACING)
-            {
+            if self.is_third_party_beam_hit(b, bt, obs) && self.third_party_beam_ts.iter().all(|&ts| (ts - bt).abs() > FFA_BEAM_SPACING) {
                 self.third_party_beam_ts.push(bt);
             }
         }
     }
 
-    /// The beam ends on a known mech other than its shooter, and not near us.
-    fn is_third_party_hit(&self, b: &BeamObs, bt: f64, obs: &Obs) -> bool {
+    /// A laser beam that ends on another enemy mech: far from us, far from
+    /// every known NPC and crate (so it was not PvE fire), and within reach of
+    /// a mech other than the shooter seen around the time of the shot.
+    fn is_third_party_beam_hit(&self, b: &BeamObs, bt: f64, obs: &Obs) -> bool {
+        if b.kind != BeamKind::Laser && b.path.len() < 2 {
+            return false;
+        }
         let Some(&end) = b.path.last() else {
             return false;
         };
-        if dist2d(end, obs.me.pos) <= self.mech_radius + BEAM_NEAR_US {
+        if dist2d(end, obs.me.pos) <= FFA_BEAM_FAR_FROM_US {
+            return false;
+        }
+        let near_pve = self.npcs.values().any(|n| dist2d(end, n.pos) <= FFA_BEAM_FAR_FROM_PVE)
+            || obs
+                .mechs
+                .iter()
+                .any(|a| a.kind == ActorKind::Npc && dist2d(end, a.pos) <= FFA_BEAM_FAR_FROM_PVE)
+            || obs.crates.iter().any(|c| dist2d(end, c.pos) <= FFA_BEAM_FAR_FROM_PVE)
+            || self
+                .items
+                .iter()
+                .any(|it| matches!(it.kind, ItemKind::Crate | ItemKind::Npc) && dist2d(end, it.pos) <= FFA_BEAM_FAR_FROM_PVE);
+        if near_pve {
             return false;
         }
         self.tracks.iter().any(|(&id, tr)| {
             id != b.by
-                && (bt - tr.last_seen_t).abs() <= 1.0
-                && dist2d(end, tr.pos) <= self.mech_radius + BEAM_HIT_SLACK
-                && end[2] >= tr.pos[2] - BEAM_HIT_SLACK
-                && end[2] <= tr.pos[2] + self.mech_height + BEAM_HIT_SLACK
+                && (bt - tr.last_seen_t).abs() <= FFA_BEAM_SEEN_S
+                && dist2d(end, tr.pos) <= FFA_BEAM_HIT_R
+                && end[2] >= tr.pos[2] - FFA_BEAM_HIT_Z
+                && end[2] <= tr.pos[2] + self.mech_height + FFA_BEAM_HIT_Z
         })
+    }
+
+    /// True when protocol §8 vision would show an item at `pos` to an eye at
+    /// `eye`: inside the near range with a clear line, or inside the vision
+    /// range, the yaw wedge, and clear sight (canopy included). Margins keep
+    /// borderline cases from deleting items we merely failed to see.
+    pub fn should_see_item(&self, obs: &Obs, world: &World, eye: [f64; 3], pos: [f64; 3]) -> bool {
+        let stats = &obs.me.stats;
+        let target = [pos[0], pos[1], pos[2] + 0.5];
+        let d = dist3d(eye, target);
+        let near = self.vision.near_range + stats.near_range_bonus - SEE_RANGE_MARGIN;
+        if d <= near {
+            return world.los(eye, target);
+        }
+        let range = self.vision.range + stats.vision_bonus - SEE_RANGE_MARGIN;
+        if d > range {
+            return false;
+        }
+        let half_fov = 0.5 * self.vision.fov_deg.to_radians();
+        if wrap_pi(yaw_to(eye, target) - obs.me.aim[0]).abs() > half_fov - SEE_FOV_MARGIN {
+            return false;
+        }
+        world.sight(eye, target)
     }
 
     fn update_events(&mut self, obs: &Obs) {
@@ -519,11 +546,7 @@ impl BotMemory {
         for ev in &obs.events {
             match ev {
                 GameEvent::Damaged {
-                    amount,
-                    weapon,
-                    bearing,
-                    by,
-                    ..
+                    amount, weapon, bearing, by, ..
                 } => {
                     self.last_damage_t = t;
                     // Our own mortar splash is not an attacker.
@@ -544,12 +567,7 @@ impl BotMemory {
                         }
                     }
                 }
-                GameEvent::Hit {
-                    target,
-                    amount,
-                    weapon,
-                    ..
-                } => {
+                GameEvent::Hit { target, amount, weapon, .. } => {
                     if self.is_enemy_mech(*target, obs) {
                         self.ledger.entry(*target).or_default().damage_we_dealt += amount;
                         self.last_damage_dealt_t = t;
@@ -560,11 +578,7 @@ impl BotMemory {
                 }
                 GameEvent::Kill { target } => {
                     self.last_kill_t = t;
-                    self.last_kill_pos = self
-                        .tracks
-                        .get(target)
-                        .map(|tr| tr.pos)
-                        .or_else(|| self.npcs.get(target).map(|n| n.pos));
+                    self.last_kill_pos = self.tracks.get(target).map(|tr| tr.pos).or_else(|| self.npcs.get(target).map(|n| n.pos));
                     if *target < MECH_ID_LIMIT {
                         self.my_kills += 1;
                     }
@@ -584,8 +598,7 @@ impl BotMemory {
 
     fn note_hit_bearing(&mut self, obs: &Obs, bearing: f64, by: Option<u32>, weapon: &DamageKind) {
         let by_visible = by.is_some_and(|id| self.tracks.get(&id).is_some_and(|tr| tr.visible_now));
-        let explained =
-            by_visible || (by.is_none() && self.visible_mech_near_bearing(obs.me.pos, bearing));
+        let explained = by_visible || (by.is_none() && self.visible_mech_near_bearing(obs.me.pos, bearing));
         if explained {
             return;
         }
@@ -593,19 +606,15 @@ impl BotMemory {
         self.ghost = Some(Ghost {
             bearing,
             t: obs.t,
-            pos: [
-                p[0] + GHOST_RANGE * bearing.cos(),
-                p[1] + GHOST_RANGE * bearing.sin(),
-                p[2],
-            ],
+            pos: [p[0] + GHOST_RANGE * bearing.cos(), p[1] + GHOST_RANGE * bearing.sin(), p[2]],
             weapon: weapon_of(weapon),
         });
     }
 
     fn visible_mech_near_bearing(&self, from: [f64; 3], bearing: f64) -> bool {
-        self.tracks.values().any(|tr| {
-            tr.visible_now && wrap_pi(yaw_to(from, tr.pos) - bearing).abs() <= GHOST_EXPLAIN_RAD
-        })
+        self.tracks
+            .values()
+            .any(|tr| tr.visible_now && wrap_pi(yaw_to(from, tr.pos) - bearing).abs() <= GHOST_EXPLAIN_RAD)
     }
 
     fn remove_item(&mut self, id: u32) {
@@ -671,9 +680,22 @@ impl BotMemory {
                 gone.push(it.id);
                 continue;
             }
-            let meta = self.item_meta.entry(it.id).or_default();
+            // Cubes and pickups we should see but do not are gone: taken by
+            // someone, or never where we thought.
+            if matches!(it.kind, ItemKind::Cube | ItemKind::Weapon) && self.should_see_item(obs, world, eye, it.pos) {
+                let listed = match it.kind {
+                    ItemKind::Cube => obs.cubes.iter().any(|c| c.id == it.id),
+                    _ => obs.pickups.iter().any(|p| p.id == it.id),
+                };
+                if !listed {
+                    gone.push(it.id);
+                    continue;
+                }
+            }
             let target = [it.pos[0], it.pos[1], it.pos[2] + 0.5];
-            if dist3d(eye, it.pos) <= ITEM_DELETE_R && world.los(eye, target) {
+            let in_view = dist3d(eye, it.pos) <= ITEM_DELETE_R && world.los(eye, target);
+            let meta = self.item_meta.entry(it.id).or_default();
+            if in_view {
                 meta.misses += 1;
                 if meta.misses >= ITEM_DELETE_MISSES {
                     gone.push(it.id);
@@ -718,48 +740,33 @@ impl BotMemory {
                 _ => None,
             })
             .unwrap_or(self.weapons_cfg.gun.range);
-        let at_mech = self.tracks.values().any(|tr| {
-            tr.visible_now
-                && dist3d(me.pos, tr.pos) <= range * 1.2
-                && wrap_pi(yaw_to(me.pos, tr.pos) - me.aim[0]).abs() <= FIRE_AIM_TOL
-        });
+        let at_mech = self
+            .tracks
+            .values()
+            .any(|tr| tr.visible_now && dist3d(me.pos, tr.pos) <= range * 1.2 && wrap_pi(yaw_to(me.pos, tr.pos) - me.aim[0]).abs() <= FIRE_AIM_TOL);
         if self.bandit.observe_ammo(&me.weapons, at_mech, rng) > 0 {
             self.last_mech_shot_t = obs.t;
         }
     }
 
+    /// Latches free-for-all after three straight decisions with a signal that
+    /// a practice match cannot produce: deaths we did not cause under a zone
+    /// too weak to explain them, or two spaced laser hits between other mechs.
     fn update_ffa(&mut self, obs: &Obs) {
+        if self.start_alive.is_none() && obs.alive > 0 && obs.t <= 1.0 {
+            self.start_alive = Some(obs.alive);
+        }
         if self.ffa_detected {
             return;
         }
-        let t = obs.t;
         let beams = self.third_party_beam_ts.len() >= FFA_BEAM_HITS;
-        let zone = &obs.zone;
-        let missing = obs.mechs.iter().any(|m| {
-            if m.kind != ActorKind::Mech || !self.is_enemy_mech(m.id, obs) {
-                return false;
-            }
-            let (Some(hp), Some(max_hp)) = (m.hp, m.max_hp) else {
-                return false;
-            };
-            // Zone damage is not a third party.
-            let in_zone =
-                zone.dps <= 0.0 || dist_xy([m.pos[0], m.pos[1]], zone.center) <= zone.radius;
-            let dealt = self.ledger.get(&m.id).map_or(0.0, |l| l.damage_we_dealt);
-            in_zone && (max_hp - hp) - dealt > FFA_MISSING_HP
-        });
-        let deaths = if obs.alive == 0 {
-            false
-        } else {
-            let foreign = self
-                .mech_count
-                .saturating_sub(obs.alive)
-                .saturating_sub(self.my_kills);
-            zone.dps < FFA_ZONE_DPS
-                && ((foreign >= FFA_DEATHS_EARLY.0 && t <= FFA_DEATHS_EARLY.1)
-                    || (foreign >= FFA_DEATHS_LATE.0 && t <= FFA_DEATHS_LATE.1))
+        let dps = obs.zone.dps;
+        let deaths = obs.alive != 0 && {
+            let start_alive = self.start_alive.unwrap_or(self.mech_count);
+            let foreign = start_alive.saturating_sub(obs.alive).saturating_sub(self.my_kills);
+            (foreign >= FFA_DEATHS_CALM.0 && dps <= FFA_DEATHS_CALM.1) || (foreign >= FFA_DEATHS_ANY.0 && dps <= FFA_DEATHS_ANY.1)
         };
-        if beams || missing || deaths {
+        if beams || deaths {
             self.ffa_streak += 1;
             if self.ffa_streak >= FFA_LATCH_TICKS {
                 self.ffa_detected = true;
@@ -773,11 +780,10 @@ impl BotMemory {
         let t = obs.t;
         for s in &obs.sounds {
             let st = t - s.age;
-            let dup = self.sounds.iter().any(|h| {
-                h.kind == s.kind
-                    && (h.t - st).abs() < 0.06
-                    && wrap_pi(h.bearing - s.bearing).abs() < 0.05
-            });
+            let dup = self
+                .sounds
+                .iter()
+                .any(|h| h.kind == s.kind && (h.t - st).abs() < 0.06 && wrap_pi(h.bearing - s.bearing).abs() < 0.05);
             if !dup {
                 self.sounds.push(HeardSound {
                     kind: s.kind.clone(),
@@ -793,6 +799,11 @@ impl BotMemory {
     /// True once a free-for-all has been detected. Never resets.
     pub fn is_ffa(&self) -> bool {
         self.ffa_detected
+    }
+
+    /// Initial alive mech count captured at match start, if seen.
+    pub fn start_alive(&self) -> Option<u32> {
+        self.start_alive
     }
 
     /// The gun lead bandit.
@@ -815,16 +826,14 @@ impl BotMemory {
             let led = self.ledger.get(&id).copied().unwrap_or_default();
             let dist = dist3d(me, tr.pos);
             let body = [tr.pos[0], tr.pos[1], tr.pos[2] + 0.6 * self.mech_height];
-            let aims_at_us =
-                tr.visible_now && wrap_pi(tr.aim[0] - yaw_to(tr.pos, me)).abs() <= AWARE_AIM_TOL;
+            let aims_at_us = tr.visible_now && wrap_pi(tr.aim[0] - yaw_to(tr.pos, me)).abs() <= AWARE_AIM_TOL;
             let is_aware = aims_at_us || t - led.last_hit_us_t <= AWARE_HIT_S;
             let stale = if tr.visible_now {
                 1.0
             } else {
                 clamp(1.0 - (t - tr.last_seen_t) / MECH_TRACK_TTL, 0.3, 1.0)
             };
-            let threat_dps =
-                self.weapon_dps(&tr.weapons, dist) * if is_aware { 1.0 } else { 0.5 } * stale;
+            let threat_dps = self.weapon_dps(&tr.weapons, dist) * if is_aware { 1.0 } else { 0.5 } * stale;
             out.push(ThreatInfo {
                 id,
                 pos: tr.pos,
@@ -911,11 +920,7 @@ impl BotMemory {
             }
             WeaponKind::Mortar => {
                 let m = &w.mortar;
-                let reach = if m.gravity > 0.0 {
-                    m.speed * m.speed / m.gravity
-                } else {
-                    f64::INFINITY
-                };
+                let reach = if m.gravity > 0.0 { m.speed * m.speed / m.gravity } else { f64::INFINITY };
                 if dist > reach || m.cooldown <= 0.0 {
                     0.0
                 } else {
@@ -951,9 +956,7 @@ impl BotMemory {
 
     /// `(bearing, age)` of the last hit from an unseen attacker, within 3.5 s.
     pub fn unseen_hit_bearing(&self, t: f64) -> Option<(f64, f64)> {
-        self.ghost
-            .filter(|g| t - g.t <= GHOST_TTL)
-            .map(|g| (g.bearing, (t - g.t).max(0.0)))
+        self.ghost.filter(|g| t - g.t <= GHOST_TTL).map(|g| (g.bearing, (t - g.t).max(0.0)))
     }
 
     /// Remembered items, NPCs, and drops.
@@ -986,12 +989,7 @@ impl BotMemory {
                 SoundDist::Far => 1.0,
             };
             let kind_w = match h.kind {
-                SoundKind::Gun
-                | SoundKind::Laser
-                | SoundKind::LaserCharge
-                | SoundKind::Lightning
-                | SoundKind::Mortar
-                | SoundKind::Explosion => 1.0,
+                SoundKind::Gun | SoundKind::Laser | SoundKind::LaserCharge | SoundKind::Lightning | SoundKind::Mortar | SoundKind::Explosion => 1.0,
                 SoundKind::Step | SoundKind::Boost | SoundKind::Jet | SoundKind::Reload => 0.5,
                 _ => 0.25,
             };
@@ -999,13 +997,7 @@ impl BotMemory {
         };
         self.sounds
             .iter()
-            .filter(|h| {
-                t - h.t <= SOUND_TTL
-                    && !matches!(
-                        h.kind,
-                        SoundKind::NpcGun | SoundKind::Drop | SoundKind::Other(_)
-                    )
-            })
+            .filter(|h| t - h.t <= SOUND_TTL && !matches!(h.kind, SoundKind::NpcGun | SoundKind::Drop | SoundKind::Other(_)))
             .max_by(|a, b| score(a).total_cmp(&score(b)))
             .map(|h| (h.bearing, h.dist, h.kind.clone()))
     }
@@ -1013,9 +1005,7 @@ impl BotMemory {
     /// True if within `window` seconds we took non-zone damage, hit a mech, or
     /// fired the gun at one.
     pub fn recently_engaged_or_damaged(&self, t: f64, window: f64) -> bool {
-        t - self.last_hostile_damage_t <= window
-            || t - self.last_damage_dealt_t <= window
-            || t - self.last_mech_shot_t <= window
+        t - self.last_hostile_damage_t <= window || t - self.last_damage_dealt_t <= window || t - self.last_mech_shot_t <= window
     }
 }
 
@@ -1051,11 +1041,7 @@ fn lead2_accel(hist: &VecDeque<(f64, [f64; 3])>, t: f64, v: [f64; 3]) -> [f64; 3
     for i in 0..3 {
         a[i] = ACCEL_DAMP * (v[i] - old[i]) / dt;
     }
-    let cap = if v[2].abs() > AIRBORNE_VZ {
-        ACCEL_CAP_AIR
-    } else {
-        ACCEL_CAP_GROUND
-    };
+    let cap = if v[2].abs() > AIRBORNE_VZ { ACCEL_CAP_AIR } else { ACCEL_CAP_GROUND };
     let h = a[0].hypot(a[1]);
     if h > cap {
         a[0] *= cap / h;
@@ -1068,9 +1054,7 @@ fn lead2_accel(hist: &VecDeque<(f64, [f64; 3])>, t: f64, v: [f64; 3]) -> [f64; 3
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::{
-        BeamKind, DropObs, GunStats, ItemObs, MechStats, PickupObs, SelfObs, SoundObs, ZoneObs,
-    };
+    use proto::{BeamKind, DropObs, GunStats, ItemObs, MechStats, PickupObs, SelfObs, SoundObs, ZoneObs};
     use world::{Prism, PrismKind};
 
     const ME: u32 = 0;
@@ -1132,12 +1116,7 @@ mod tests {
         }
     }
 
-    fn damaged(
-        amount: f64,
-        weapon: DamageKind,
-        bearing: Option<f64>,
-        by: Option<u32>,
-    ) -> GameEvent {
+    fn damaged(amount: f64, weapon: DamageKind, bearing: Option<f64>, by: Option<u32>) -> GameEvent {
         GameEvent::Damaged {
             amount,
             weapon,
@@ -1167,23 +1146,13 @@ mod tests {
     }
 
     fn setup() -> (BotMemory, World, Rng64) {
-        (
-            BotMemory::new(ME, &Config::default()),
-            World::flat(1000.0),
-            Rng64::new(7, ME),
-        )
+        (BotMemory::new(ME, &Config::default()), World::flat(1000.0), Rng64::new(7, ME))
     }
 
     /// A wall from x = 10 to 20 across y = -50..50, 30 m tall.
     fn walled() -> World {
         let mut w = World::flat(1000.0);
-        w.prisms.push(Prism::rect(
-            PrismKind::Building,
-            [10.0, -50.0],
-            [20.0, 50.0],
-            0.0,
-            30.0,
-        ));
+        w.prisms.push(Prism::rect(PrismKind::Building, [10.0, -50.0], [20.0, 50.0], 0.0, 30.0));
         w
     }
 
@@ -1197,11 +1166,7 @@ mod tests {
         b.record_shots(11, &mut rng);
         assert_eq!((b.active, b.bucket_shots), (1, 11));
         b.record_shots(1, &mut rng);
-        assert_eq!(
-            (b.active, b.bucket_shots),
-            (0, 0),
-            "first untried arm, lowest index"
-        );
+        assert_eq!((b.active, b.bucket_shots), (0, 0), "first untried arm, lowest index");
         b.record_shots(12, &mut rng);
         assert_eq!(b.active, 2);
         assert_eq!(b.current_km(), 1.3);
@@ -1223,10 +1188,7 @@ mod tests {
         }
         // 80% exploit + 1/3 of the 20% explore ≈ 86.7% for arm 1.
         assert!(picks[1] > 1600 && picks[1] < 1860, "{picks:?}");
-        assert!(
-            picks[0] > 60 && picks[2] > 60,
-            "exploration reaches every arm: {picks:?}"
-        );
+        assert!(picks[0] > 60 && picks[2] > 60, "exploration reaches every arm: {picks:?}");
     }
 
     #[test]
@@ -1251,27 +1213,11 @@ mod tests {
     fn bandit_counts_ammo_drops_only_at_mechs_and_not_reloads() {
         let mut b = HitBandit::default();
         let mut rng = Rng64::new(1, 0);
-        assert_eq!(
-            b.observe_ammo(&[Some(gun(12.0)), None], true, &mut rng),
-            0,
-            "first sample is the baseline"
-        );
+        assert_eq!(b.observe_ammo(&[Some(gun(12.0)), None], true, &mut rng), 0, "first sample is the baseline");
         assert_eq!(b.observe_ammo(&[Some(gun(10.0)), None], true, &mut rng), 2);
-        assert_eq!(
-            b.observe_ammo(&[Some(gun(9.0)), None], false, &mut rng),
-            0,
-            "not at a mech"
-        );
-        assert_eq!(
-            b.observe_ammo(&[Some(gun(12.0)), None], true, &mut rng),
-            0,
-            "reload"
-        );
-        assert_eq!(
-            b.observe_ammo(&[None, Some(gun(11.0))], true, &mut rng),
-            0,
-            "slot change resets the baseline"
-        );
+        assert_eq!(b.observe_ammo(&[Some(gun(9.0)), None], false, &mut rng), 0, "not at a mech");
+        assert_eq!(b.observe_ammo(&[Some(gun(12.0)), None], true, &mut rng), 0, "reload");
+        assert_eq!(b.observe_ammo(&[None, Some(gun(11.0))], true, &mut rng), 0, "slot change resets the baseline");
         assert_eq!(b.observe_ammo(&[None, Some(gun(10.0))], true, &mut rng), 1);
         assert_eq!(b.observe_ammo(&[None, None], true, &mut rng), 0);
         assert_eq!(b.shots[1], 3);
@@ -1286,10 +1232,7 @@ mod tests {
         let mut o = obs_at(1.1);
         o.mechs = vec![mech(3, [100.0, 0.0, 0.0], [0.0; 3])];
         o.me.weapons = [Some(gun(9.0)), None];
-        o.events = vec![
-            hit(3, 45.0, DamageKind::Gun),
-            hit(120, 45.0, DamageKind::Gun),
-        ];
+        o.events = vec![hit(3, 45.0, DamageKind::Gun), hit(120, 45.0, DamageKind::Gun)];
         m.update(&o, &w, &mut rng);
         assert_eq!(m.hit_bandit().shots[1], 3);
         assert_eq!(m.hit_bandit().hits[1], 1, "NPC hits do not count");
@@ -1319,37 +1262,14 @@ mod tests {
     #[test]
     fn accel_is_damped_difference_against_oldest_valid_sample() {
         let (mut m, w, mut rng) = setup();
-        feed_vel(
-            &mut m,
-            &w,
-            &mut rng,
-            &[(1.0, [0.0; 3]), (1.1, [1.0, 0.0, 0.0])],
-        );
+        feed_vel(&mut m, &w, &mut rng, &[(1.0, [0.0; 3]), (1.1, [1.0, 0.0, 0.0])]);
         assert_eq!(m.track_accel(5), [0.0; 3], "no sample old enough");
-        feed_vel(
-            &mut m,
-            &w,
-            &mut rng,
-            &[
-                (1.2, [2.0, 0.0, 0.0]),
-                (1.3, [3.0, 0.0, 0.0]),
-                (1.4, [4.0, 0.0, 0.0]),
-            ],
-        );
+        feed_vel(&mut m, &w, &mut rng, &[(1.2, [2.0, 0.0, 0.0]), (1.3, [3.0, 0.0, 0.0]), (1.4, [4.0, 0.0, 0.0])]);
         // Oldest sample (t=1.0, age 0.4): 0.5 * 4 / 0.4 = 5.
         let a = m.track_accel(5);
         assert!((a[0] - 5.0).abs() < 1e-9 && a[1] == 0.0, "{a:?}");
         // Window slides: at t = 1.7 the t=1.0 sample is gone, oldest is 1.1.
-        feed_vel(
-            &mut m,
-            &w,
-            &mut rng,
-            &[
-                (1.5, [4.0, 0.0, 0.0]),
-                (1.6, [4.0, 0.0, 0.0]),
-                (1.7, [4.0, 0.0, 0.0]),
-            ],
-        );
+        feed_vel(&mut m, &w, &mut rng, &[(1.5, [4.0, 0.0, 0.0]), (1.6, [4.0, 0.0, 0.0]), (1.7, [4.0, 0.0, 0.0])]);
         let a = m.track_accel(5);
         assert!((a[0] - 0.5 * 3.0 / 0.6).abs() < 1e-9, "{a:?}");
         assert_eq!(m.track_accel(9), [0.0; 3], "unknown id");
@@ -1358,46 +1278,26 @@ mod tests {
     #[test]
     fn accel_clamps_ground_air_and_vertical() {
         let (mut m, w, mut rng) = setup();
-        feed_vel(
-            &mut m,
-            &w,
-            &mut rng,
-            &[(1.0, [0.0; 3]), (1.2, [60.0, 80.0, 0.0])],
-        );
+        feed_vel(&mut m, &w, &mut rng, &[(1.0, [0.0; 3]), (1.2, [60.0, 80.0, 0.0])]);
         let a = m.track_accel(5);
         assert!((a[0].hypot(a[1]) - 58.0).abs() < 1e-9, "{a:?}");
         assert!((a[1] / a[0] - 80.0 / 60.0).abs() < 1e-9, "direction kept");
 
         let (mut m, w, mut rng) = setup();
-        feed_vel(
-            &mut m,
-            &w,
-            &mut rng,
-            &[(1.0, [0.0; 3]), (1.2, [20.0, 0.0, 30.0])],
-        );
+        feed_vel(&mut m, &w, &mut rng, &[(1.0, [0.0; 3]), (1.2, [20.0, 0.0, 30.0])]);
         let a = m.track_accel(5);
         assert!((a[0] - 12.0).abs() < 1e-9, "airborne cap: {a:?}");
         assert_eq!(a[2], 34.0);
 
         let (mut m, w, mut rng) = setup();
-        feed_vel(
-            &mut m,
-            &w,
-            &mut rng,
-            &[(1.0, [0.0; 3]), (1.2, [0.0, 0.0, -30.0])],
-        );
+        feed_vel(&mut m, &w, &mut rng, &[(1.0, [0.0; 3]), (1.2, [0.0, 0.0, -30.0])]);
         assert_eq!(m.track_accel(5)[2], -22.0);
     }
 
     #[test]
     fn accel_resets_when_out_of_sight() {
         let (mut m, w, mut rng) = setup();
-        feed_vel(
-            &mut m,
-            &w,
-            &mut rng,
-            &[(1.0, [0.0; 3]), (1.3, [3.0, 0.0, 0.0])],
-        );
+        feed_vel(&mut m, &w, &mut rng, &[(1.0, [0.0; 3]), (1.3, [3.0, 0.0, 0.0])]);
         assert!(m.track_accel(5)[0] > 0.0);
         m.update(&obs_at(1.4), &w, &mut rng);
         assert_eq!(m.track_accel(5), [0.0; 3]);
@@ -1407,10 +1307,7 @@ mod tests {
     fn mech_tracks_expire_after_18s_and_npcs_after_60s() {
         let (mut m, w, mut rng) = setup();
         let mut o = obs_at(0.0);
-        o.mechs = vec![
-            mech(5, [50.0, 0.0, 0.0], [0.0; 3]),
-            npc(120, [30.0, 0.0, 0.0]),
-        ];
+        o.mechs = vec![mech(5, [50.0, 0.0, 0.0], [0.0; 3]), npc(120, [30.0, 0.0, 0.0])];
         m.update(&o, &w, &mut rng);
         m.update(&obs_at(17.9), &w, &mut rng);
         assert_eq!(m.threats(&obs_at(17.9), &w).len(), 1);
@@ -1574,13 +1471,7 @@ mod tests {
 
     // ---- FFA ----
 
-    fn run_ffa(
-        m: &mut BotMemory,
-        w: &World,
-        rng: &mut Rng64,
-        mut make: impl FnMut(f64) -> Obs,
-        ts: &[f64],
-    ) {
+    fn run_ffa(m: &mut BotMemory, w: &World, rng: &mut Rng64, mut make: impl FnMut(f64) -> Obs, ts: &[f64]) {
         for &t in ts {
             m.update(&make(t), w, rng);
         }
@@ -1591,10 +1482,7 @@ mod tests {
         let (mut m, w, mut rng) = setup();
         let make = |t: f64| {
             let mut o = obs_at(t);
-            o.mechs = vec![
-                mech(3, [100.0, 0.0, 0.0], [0.0; 3]),
-                mech(4, [100.0, 60.0, 0.0], [0.0; 3]),
-            ];
+            o.mechs = vec![mech(3, [100.0, 0.0, 0.0], [0.0; 3]), mech(4, [100.0, 60.0, 0.0], [0.0; 3])];
             o
         };
         // One beam 3 -> 4, seen on two decisions with growing age: one event.
@@ -1647,15 +1535,8 @@ mod tests {
         let (mut m, w, mut rng) = setup();
         for (i, t) in [10.0, 12.0, 14.0, 16.0, 18.0].into_iter().enumerate() {
             let mut o = obs_at(t);
-            o.mechs = vec![
-                mech(3, [100.0, 0.0, 0.0], [0.0; 3]),
-                mech(4, [100.0, 60.0, 0.0], [0.0; 3]),
-            ];
-            let end = if i % 2 == 0 {
-                [50.0, 50.0, 0.0]
-            } else {
-                [1.0, 0.0, 5.0]
-            };
+            o.mechs = vec![mech(3, [100.0, 0.0, 0.0], [0.0; 3]), mech(4, [100.0, 60.0, 0.0], [0.0; 3])];
+            let end = if i % 2 == 0 { [50.0, 50.0, 0.0] } else { [1.0, 0.0, 5.0] };
             o.beams = vec![beam(3, [100.0, 0.0, 7.0], end, 0.0)];
             m.update(&o, &w, &mut rng);
         }
@@ -1664,59 +1545,19 @@ mod tests {
     }
 
     #[test]
-    fn ffa_latches_on_unexplained_missing_hp() {
+    fn missing_hp_alone_never_latches_ffa() {
         let (mut m, w, mut rng) = setup();
-        let hurt = |t: f64, hp: f64| {
-            let mut o = obs_at(t);
-            let mut e = mech(3, [100.0, 0.0, 0.0], [0.0; 3]);
-            e.hp = Some(hp);
-            o.mechs = vec![e];
-            o
-        };
-        // We dealt 900; it misses 1100: only 200 unexplained.
-        let mut o = hurt(1.0, 300.0);
-        o.events = vec![hit(3, 900.0, DamageKind::Laser)];
-        m.update(&o, &w, &mut rng);
-        run_ffa(
-            &mut m,
-            &w,
-            &mut rng,
-            |t| hurt(t, 300.0),
-            &[1.1, 1.2, 1.3, 1.4],
-        );
-        assert!(!m.is_ffa());
-        // Mech 4 misses 400 we never dealt, but hp hidden: skipped.
-        run_ffa(
-            &mut m,
-            &w,
-            &mut rng,
-            |t| {
-                let mut o = obs_at(t);
-                let mut e = mech(4, [100.0, 0.0, 0.0], [0.0; 3]);
-                e.hp = None;
-                o.mechs = vec![e];
-                o
-            },
-            &[1.5, 1.6, 1.7],
-        );
-        assert!(!m.is_ffa());
-        // Interrupted streak resets.
-        let missing = |t: f64| {
+        // An enemy missing 1000 hp we never dealt: NPCs or the zone could
+        // have done it, so it is no proof of a third party.
+        let hurt = |t: f64| {
             let mut o = obs_at(t);
             let mut e = mech(4, [100.0, 0.0, 0.0], [0.0; 3]);
-            e.hp = Some(1000.0);
+            e.hp = Some(400.0);
             o.mechs = vec![e];
             o
         };
-        run_ffa(&mut m, &w, &mut rng, missing, &[2.0, 2.1]);
-        m.update(&obs_at(2.2), &w, &mut rng);
-        run_ffa(&mut m, &w, &mut rng, missing, &[2.3, 2.4]);
+        run_ffa(&mut m, &w, &mut rng, hurt, &[1.0, 1.1, 1.2, 1.3, 1.4, 1.5]);
         assert!(!m.is_ffa());
-        run_ffa(&mut m, &w, &mut rng, missing, &[2.5]);
-        assert!(m.is_ffa());
-        // Latched for good.
-        m.update(&obs_at(3.0), &w, &mut rng);
-        assert!(m.is_ffa());
     }
 
     #[test]
@@ -1745,60 +1586,97 @@ mod tests {
     }
 
     #[test]
-    fn ffa_latches_on_early_foreign_deaths() {
+    fn ffa_latches_on_foreign_deaths_under_a_weak_zone() {
         let (mut m, w, mut rng) = setup();
-        let with_alive = |alive: u32| move |t: f64| Obs { alive, ..obs_at(t) };
+        let with = |alive: u32, dps: f64| {
+            move |t: f64| {
+                let mut o = Obs { alive, ..obs_at(t) };
+                o.zone.dps = dps;
+                o
+            }
+        };
         // We killed one; one other death: only one foreign.
-        let mut o = with_alive(14)(30.0);
+        let mut o = with(14, 0.0)(30.0);
         o.events = vec![GameEvent::Kill { target: 3 }];
         m.update(&o, &w, &mut rng);
-        run_ffa(&mut m, &w, &mut rng, with_alive(14), &[30.1, 30.2, 30.3]);
+        run_ffa(&mut m, &w, &mut rng, with(14, 0.0), &[30.1, 30.2, 30.3]);
         assert!(!m.is_ffa());
-        // Two foreign deaths but after 45 s.
-        run_ffa(&mut m, &w, &mut rng, with_alive(13), &[46.0, 46.1, 46.2]);
+        // Two foreign deaths, but the zone hurts enough to explain them.
+        run_ffa(&mut m, &w, &mut rng, with(13, 36.0), &[60.0, 60.1, 60.2]);
         assert!(!m.is_ffa());
-        // Four foreign deaths by 75 s, but zone dps high.
-        run_ffa(
-            &mut m,
-            &w,
-            &mut rng,
-            |t| {
-                let mut o = with_alive(11)(t);
-                o.zone.dps = 120.0;
-                o
-            },
-            &[60.0, 60.1, 60.2],
-        );
+        // Three foreign deaths, but the zone is deadly.
+        run_ffa(&mut m, &w, &mut rng, with(12, 101.0), &[70.0, 70.1, 70.2]);
         assert!(!m.is_ffa());
-        run_ffa(&mut m, &w, &mut rng, with_alive(11), &[60.3, 60.4, 60.5]);
+        // Three foreign deaths under a 100 dps zone latch, late or not.
+        run_ffa(&mut m, &w, &mut rng, with(12, 100.0), &[120.0, 120.1]);
+        assert!(!m.is_ffa(), "needs three decisions");
+        run_ffa(&mut m, &w, &mut rng, with(12, 100.0), &[120.2]);
         assert!(m.is_ffa());
+        // Latched for good.
+        m.update(&obs_at(130.0), &w, &mut rng);
+        assert!(m.is_ffa());
+    }
+
+    #[test]
+    fn two_foreign_deaths_under_a_35_dps_zone_latch() {
+        let (mut m, w, mut rng) = setup();
+        let make = |t: f64| {
+            let mut o = Obs { alive: 14, ..obs_at(t) };
+            o.zone.dps = 35.0;
+            o
+        };
+        run_ffa(&mut m, &w, &mut rng, make, &[200.0, 200.1]);
+        m.update(&obs_at(200.2), &w, &mut rng);
+        run_ffa(&mut m, &w, &mut rng, make, &[200.3, 200.4]);
+        assert!(!m.is_ffa(), "interrupted streak resets");
+        run_ffa(&mut m, &w, &mut rng, make, &[200.5]);
+        assert!(m.is_ffa());
+    }
+
+    #[test]
+    fn beams_near_npcs_crates_or_short_of_a_mech_are_not_third_party() {
+        let (mut m, w, mut rng) = setup();
+        for (i, t) in [10.0, 12.0, 14.0, 16.0].into_iter().enumerate() {
+            let mut o = obs_at(t);
+            // Mech 4 stands next to an NPC and a crate sits near mech 5.
+            o.mechs = vec![
+                mech(3, [100.0, 0.0, 0.0], [0.0; 3]),
+                mech(4, [100.0, 60.0, 0.0], [0.0; 3]),
+                mech(5, [-100.0, 60.0, 0.0], [0.0; 3]),
+                mech(6, [0.0, 200.0, 0.0], [0.0; 3]),
+                npc(120, [105.0, 65.0, 0.0]),
+            ];
+            o.crates = vec![ItemObs {
+                id: 1001,
+                pos: [-95.0, 62.0, 0.0],
+                hp: Some(80.0),
+            }];
+            let end = match i {
+                0 => [100.0, 59.0, 5.0],  // on mech 4, but beside the NPC
+                1 => [-100.0, 59.0, 5.0], // on mech 5, but beside the crate
+                2 => [100.0, 54.0, 5.0],  // 6 m short of mech 4
+                _ => [0.0, 199.0, 12.0],  // above mech 6's head
+            };
+            o.beams = vec![beam(3, [100.0, 0.0, 7.0], end, 0.0)];
+            m.update(&o, &w, &mut rng);
+        }
+        assert!(m.third_party_beam_ts.is_empty(), "{:?}", m.third_party_beam_ts);
     }
 
     #[test]
     fn early_two_foreign_deaths_latch_and_alive_zero_is_ignored() {
         let (mut m, w, mut rng) = setup();
-        run_ffa(
-            &mut m,
-            &w,
-            &mut rng,
-            |t| Obs {
-                alive: 0,
-                ..obs_at(t)
-            },
-            &[5.0, 5.1, 5.2, 5.3],
-        );
+        run_ffa(&mut m, &w, &mut rng, |t| Obs { alive: 0, ..obs_at(t) }, &[5.0, 5.1, 5.2, 5.3]);
         assert!(!m.is_ffa());
-        run_ffa(
-            &mut m,
-            &w,
-            &mut rng,
-            |t| Obs {
-                alive: 14,
-                ..obs_at(t)
-            },
-            &[40.0, 40.1, 40.2],
-        );
+        run_ffa(&mut m, &w, &mut rng, |t| Obs { alive: 14, ..obs_at(t) }, &[40.0, 40.1, 40.2]);
         assert!(m.is_ffa());
+    }
+
+    #[test]
+    fn small_lobby_starting_at_t0_uses_initial_alive_count() {
+        let (mut m, w, mut rng) = setup();
+        run_ffa(&mut m, &w, &mut rng, |t| Obs { alive: 2, ..obs_at(t) }, &[0.0, 0.1, 0.2, 5.0, 30.0]);
+        assert!(!m.is_ffa(), "2-mech duel starting at t=0 has zero foreign deaths");
     }
 
     // ---- kills ----
@@ -1864,10 +1742,7 @@ mod tests {
         let c = item(&m, 1001).unwrap();
         assert_eq!((c.kind, c.hp), (ItemKind::Crate, Some(80.0)));
         let p = item(&m, 8001).unwrap();
-        assert_eq!(
-            (p.kind, p.weapon_kind),
-            (ItemKind::Weapon, Some(WeaponKind::Laser))
-        );
+        assert_eq!((p.kind, p.weapon_kind), (ItemKind::Weapon, Some(WeaponKind::Laser)));
         assert_eq!(item(&m, 20001).unwrap().kind, ItemKind::Drop);
         let n = item(&m, 110).unwrap();
         assert_eq!((n.kind, n.hp), (ItemKind::Npc, Some(350.0)));
@@ -1875,25 +1750,73 @@ mod tests {
     }
 
     #[test]
-    fn close_unseen_item_with_clear_sight_is_deleted_after_two_misses() {
+    fn cube_we_should_see_is_deleted_at_once() {
         let (mut m, w, mut rng) = setup();
         m.update(&item_obs(1.0), &w, &mut rng);
         m.update(&obs_at(1.1), &w, &mut rng);
-        assert!(item(&m, 5001).is_some(), "one miss is not enough");
-        m.update(&obs_at(1.2), &w, &mut rng);
-        assert!(item(&m, 5001).is_none());
-        assert!(item(&m, 8001).is_some(), "far items stay");
-        assert!(item(&m, 1001).is_some());
+        assert!(item(&m, 5001).is_none(), "cube 20 m away in plain view");
+        assert!(item(&m, 8001).is_some(), "pickup outside the yaw wedge stays");
+        assert!(item(&m, 1001).is_some(), "far crate stays");
+        assert!(item(&m, 110).is_some(), "far NPC stays");
     }
 
     #[test]
     fn a_sighting_resets_the_miss_count() {
         let (mut m, w, mut rng) = setup();
-        m.update(&item_obs(1.0), &w, &mut rng);
+        let with_npc = |t: f64| {
+            let mut o = obs_at(t);
+            o.mechs = vec![npc(115, [20.0, 0.0, 0.0])];
+            o
+        };
+        m.update(&with_npc(1.0), &w, &mut rng);
         m.update(&obs_at(1.1), &w, &mut rng);
-        m.update(&item_obs(1.2), &w, &mut rng);
+        m.update(&with_npc(1.2), &w, &mut rng);
         m.update(&obs_at(1.3), &w, &mut rng);
-        assert!(item(&m, 5001).is_some());
+        assert!(item(&m, 115).is_some(), "NPC items still need two misses");
+        m.update(&obs_at(1.4), &w, &mut rng);
+        assert!(item(&m, 115).is_none());
+    }
+
+    #[test]
+    fn far_pickup_in_view_is_deleted_at_once_and_out_of_view_kept() {
+        let (mut m, w, mut rng) = setup();
+        let pickup = |id: u32, pos: [f64; 3]| PickupObs {
+            id,
+            kind: WeaponKind::Gun,
+            pos,
+        };
+        let mut o = obs_at(1.0);
+        o.pickups = vec![
+            pickup(8101, [150.0, 0.0, 0.0]),  // dead ahead
+            pickup(8102, [0.0, -150.0, 0.0]), // 90 degrees off
+            pickup(8103, [195.0, 0.0, 0.0]),  // past range - 8
+        ];
+        m.update(&o, &w, &mut rng);
+        let o = obs_at(1.1);
+        assert!(m.should_see_item(&o, &w, m.eye(&o), [150.0, 0.0, 0.0]));
+        assert!(!m.should_see_item(&o, &w, m.eye(&o), [0.0, -150.0, 0.0]));
+        m.update(&o, &w, &mut rng);
+        assert!(item(&m, 8101).is_none());
+        assert!(item(&m, 8102).is_some());
+        assert!(item(&m, 8103).is_some());
+        // Still listed: kept.
+        let mut o = obs_at(1.2);
+        o.pickups = vec![pickup(8102, [0.0, -150.0, 0.0])];
+        o.me.aim = [-PI / 2.0, 0.0];
+        m.update(&o, &w, &mut rng);
+        assert!(item(&m, 8102).is_some());
+    }
+
+    #[test]
+    fn vision_bonus_widens_what_we_should_see() {
+        let (m, w, _) = setup();
+        let mut o = obs_at(1.0);
+        o.me.aim = [PI, 0.0];
+        let eye = m.eye(&o);
+        // 40 m behind us: past near range - 8 = 37.
+        assert!(!m.should_see_item(&o, &w, eye, [40.0, 0.0, 0.0]));
+        o.me.stats.near_range_bonus = 15.0;
+        assert!(m.should_see_item(&o, &w, eye, [40.0, 0.0, 0.0]));
     }
 
     #[test]
@@ -1988,12 +1911,7 @@ mod tests {
     // ---- sounds ----
 
     fn sound(kind: SoundKind, bearing: f64, dist: SoundDist, age: f64) -> SoundObs {
-        SoundObs {
-            kind,
-            bearing,
-            dist,
-            age,
-        }
+        SoundObs { kind, bearing, dist, age }
     }
 
     #[test]
@@ -2007,10 +1925,7 @@ mod tests {
             sound(SoundKind::Drop, 0.5, SoundDist::Near, 0.0),
         ];
         m.update(&o, &w, &mut rng);
-        assert_eq!(
-            m.best_sound(10.0),
-            Some((2.0, SoundDist::Mid, SoundKind::Gun))
-        );
+        assert_eq!(m.best_sound(10.0), Some((2.0, SoundDist::Mid, SoundKind::Gun)));
         let mut o = obs_at(11.0);
         o.sounds = vec![sound(SoundKind::Laser, -1.0, SoundDist::Near, 0.2)];
         m.update(&o, &w, &mut rng);
@@ -2044,11 +1959,7 @@ mod tests {
                 o.me.weapons = [Some(gun(f64::from(12 - (i % 13)))), None];
                 m.update(&o, &w, &mut rng);
             }
-            (
-                m.hit_bandit().shots,
-                m.hit_bandit().active,
-                m.track_accel(3),
-            )
+            (m.hit_bandit().shots, m.hit_bandit().active, m.track_accel(3))
         };
         assert_eq!(run(), run());
     }

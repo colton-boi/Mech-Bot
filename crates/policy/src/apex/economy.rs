@@ -29,13 +29,50 @@ const CUBE_FRESH_S: f64 = 35.0;
 const CRATE_FRESH_S: f64 = 45.0;
 /// Score bonus for a laser or lightning while our second slot is empty.
 const UNARMED_SECONDARY_BONUS: f64 = 120.0;
+/// Fallback `step_up` when the stats leave it unset, meters.
+const STEP_UP_FALLBACK: f64 = 1.2;
+/// Height above both our feet and the terrain, beyond `step_up`, that marks
+/// an item as on a roof we cannot walk onto, meters.
+const ROOF_SLACK: f64 = 0.5;
+/// Height above terrain beyond which any item/pickup/cube is considered on an
+/// unreachable roof, meters.
+const ROOF_GROUND_DZ: f64 = 3.2;
+/// Calm-loot distance caps in practice, meters.
+const PRACTICE_CUBE_CAP: f64 = 110.0;
+const PRACTICE_CRATE_CAP: f64 = 100.0;
+const PRACTICE_NPC_CAP: f64 = 110.0;
+const PRACTICE_WEAPON_CAP: f64 = 150.0;
+/// Calm-loot distance caps in stealth / FFA when unarmed (no laser), meters.
+const FFA_UNARMED_CUBE_CAP: f64 = 80.0;
+const FFA_UNARMED_CRATE_CAP: f64 = 75.0;
+const FFA_UNARMED_NPC_CAP: f64 = 75.0;
+const FFA_WEAPON_CAP: f64 = 120.0;
+/// Calm-loot distance caps in stealth / FFA once armed with a Laser, meters.
+const FFA_ARMED_CUBE_CAP: f64 = 65.0;
+const FFA_ARMED_CRATE_CAP: f64 = 60.0;
+const FFA_ARMED_NPC_CAP: f64 = 65.0;
+/// Laser seek radius ceiling in stealth / free-for-all, meters.
+const FFA_LASER_CAP: f64 = 240.0;
+/// A threat seen this recently, and nearer the item by this margin, wins the race.
+const RACE_SEEN_S: f64 = 5.0;
+const RACE_MARGIN: f64 = 2.0;
+/// Free-for-all: calm loot whose straight path passes this close to a threat
+/// seen within `CORRIDOR_SEEN_S` is skipped, meters.
+const CORRIDOR_R: f64 = 55.0;
+const CORRIDOR_SEEN_S: f64 = 4.0;
+/// Seconds before the shrink starts from which calm loot must lie inside the
+/// next circle, and how far inside, meters.
+const NEXT_ZONE_GATE_S: f64 = 25.0;
+const NEXT_ZONE_MARGIN: f64 = 10.0;
 
 /// What the economy needs from the map.
 trait NavView {
     /// Whether `to` can be walked to from `from` (same or main component).
     fn reachable(&self, from: [f64; 3], to: [f64; 3]) -> bool;
-    /// Ground or roof height to stand on at `(x, y)`.
+    /// Ground height to stand on at `(x, y)`.
     fn ground_z(&self, x: f64, y: f64) -> f64;
+    /// Whether `(x, y)` is walkable in the main connected component.
+    fn is_main_xy(&self, x: f64, y: f64) -> bool;
 }
 
 /// What the economy needs from the bot's memory.
@@ -47,6 +84,8 @@ trait MemView {
     fn kill_pos(&self) -> Option<[f64; 3]>;
     /// Items seen recently, including ones out of view now.
     fn items(&self) -> &[RememberedItem];
+    /// True once a free-for-all has been detected.
+    fn is_ffa(&self) -> bool;
 }
 
 impl NavView for ApexNav {
@@ -55,11 +94,13 @@ impl NavView for ApexNav {
         // on a roof, on the main walkable area or in the same area as us.
         let ours = self.area_of(from[0], from[1]);
         let same_area = ours.is_some() && ours == self.area_of(to[0], to[1]);
-        (self.is_main_xy(to[0], to[1]) || same_area)
-            && to[2] <= self.ground_at(to[0], to[1]) + LEVEL_DZ
+        (self.is_main_xy(to[0], to[1]) || same_area) && to[2] <= self.ground_at(to[0], to[1]) + LEVEL_DZ
     }
     fn ground_z(&self, x: f64, y: f64) -> f64 {
         self.ground_at(x, y)
+    }
+    fn is_main_xy(&self, x: f64, y: f64) -> bool {
+        ApexNav::is_main_xy(self, x, y)
     }
 }
 
@@ -75,6 +116,9 @@ impl MemView for BotMemory {
     }
     fn items(&self) -> &[RememberedItem] {
         self.items()
+    }
+    fn is_ffa(&self) -> bool {
+        BotMemory::is_ffa(self)
     }
 }
 
@@ -190,19 +234,14 @@ pub fn pick_upgrade(obs: &Obs, genome: &ApexGenome) -> Option<u8> {
         let unheld = upgrade_weapon(id).is_some_and(|k| !holds(obs, k));
         base + if unheld { 1000 } else { 0 }
     };
-    let best = offer
-        .choices
-        .iter()
-        .enumerate()
-        .min_by_key(|(i, c)| (score(&c.id), *i))
-        .map(|(i, _)| i)?;
+    let best = offer.choices.iter().enumerate().min_by_key(|(i, c)| (score(&c.id), *i)).map(|(i, _)| i)?;
     Some(best as u8)
 }
 
 // ----------------------------------------------------------------- weapons
 
 /// How much `pref` values holding `kind`; 0 means never take it.
-fn weapon_rank(pref: WeaponPref, kind: WeaponKind) -> u32 {
+pub(super) fn weapon_rank(pref: WeaponPref, kind: WeaponKind) -> u32 {
     use WeaponKind::{Gun, Laser, Lightning, Mortar};
     match (pref, kind) {
         (_, Mortar) => 0,
@@ -265,8 +304,7 @@ pub fn pick_weapon_action(obs: &Obs, genome: &ApexGenome) -> (Option<u32>, Optio
         .max_by(|(a, _), (b, _)| {
             let ra = weapon_rank(genome.weapon_pref, a.kind);
             let rb = weapon_rank(genome.weapon_pref, b.kind);
-            ra.cmp(&rb)
-                .then(dist2d(b.pos, me).total_cmp(&dist2d(a.pos, me)))
+            ra.cmp(&rb).then(dist2d(b.pos, me).total_cmp(&dist2d(a.pos, me)))
         });
     match best {
         Some((p, drop)) => (Some(p.id), drop),
@@ -280,8 +318,25 @@ fn walk_speed(obs: &Obs) -> f64 {
     obs.me.stats.walk_speed.max(1.0)
 }
 
+fn step_up(obs: &Obs) -> f64 {
+    let s = obs.me.stats.step_up;
+    if s > 0.0 {
+        s
+    } else {
+        STEP_UP_FALLBACK
+    }
+}
+
+/// True for an item above both us and the terrain under it by more than a
+/// step: it sits on a roof, and walking to it pins us against the wall.
+fn on_roof<N: NavView>(obs: &Obs, nav: &N, pos: [f64; 3]) -> bool {
+    let lim = step_up(obs) + ROOF_SLACK;
+    pos[2] - obs.me.pos[2] > lim && pos[2] - nav.ground_z(pos[0], pos[1]) > lim
+}
+
 /// Whether an item is allowed at all: not blacklisted, well inside the zone,
-/// and on our level or reachable.
+/// not on a roof (`z <= ground_z + 3.2` and `on_roof == false`), on the main
+/// walkable area, and on our level or reachable.
 fn item_ok<N: NavView, M: MemView>(obs: &Obs, nav: &N, mem: &M, id: u32, pos: [f64; 3]) -> bool {
     if mem.blacklisted(id, obs.t) {
         return false;
@@ -290,7 +345,51 @@ fn item_ok<N: NavView, M: MemView>(obs: &Obs, nav: &N, mem: &M, id: u32, pos: [f
     if dist2d(pos, [z.center[0], z.center[1], 0.0]) > z.radius - ZONE_ITEM_MARGIN {
         return false;
     }
+    if pos[2] > nav.ground_z(pos[0], pos[1]) + ROOF_GROUND_DZ || !nav.is_main_xy(pos[0], pos[1]) {
+        return false;
+    }
+    if on_roof(obs, nav, pos) {
+        return false;
+    }
     (pos[2] - obs.me.pos[2]).abs() <= LEVEL_DZ || nav.reachable(obs.me.pos, pos)
+}
+
+/// A real threat seen in the last 5 s is nearer `pos` than we are (`dist`):
+/// it gets there first.
+fn raced(obs: &Obs, threats: &[ThreatInfo], pos: [f64; 3], dist: f64) -> bool {
+    threats
+        .iter()
+        .any(|th| !th.is_ghost && obs.t - th.last_seen_t <= RACE_SEEN_S && dist2d(th.pos, pos) < dist - RACE_MARGIN)
+}
+
+/// Horizontal distance from `p` to the segment `a -> b`.
+fn seg_dist2d(a: [f64; 3], b: [f64; 3], p: [f64; 3]) -> f64 {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len2 = dx * dx + dy * dy;
+    let u = if len2 > 1e-12 {
+        clamp(((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2, 0.0, 1.0)
+    } else {
+        0.0
+    };
+    (a[0] + u * dx - p[0]).hypot(a[1] + u * dy - p[1])
+}
+
+/// The straight walk to `pos` passes near a real threat seen within `CORRIDOR_SEEN_S`,
+/// nearer than the threat already is to us.
+fn corridor_blocked(obs: &Obs, threats: &[ThreatInfo], pos: [f64; 3]) -> bool {
+    let me = obs.me.pos;
+    threats
+        .iter()
+        .any(|th| !th.is_ghost && obs.t - th.last_seen_t < CORRIDOR_SEEN_S && seg_dist2d(me, pos, th.pos) < CORRIDOR_R.min(th.dist - RACE_MARGIN))
+}
+
+/// Within 25 s of the shrink, calm loot must lie 10 m inside the next circle.
+fn next_zone_ok(obs: &Obs, pos: [f64; 3]) -> bool {
+    let z = &obs.zone;
+    if z.next_radius <= 0.0 || z.shrink_start - obs.t >= NEXT_ZONE_GATE_S {
+        return true;
+    }
+    dist2d(pos, [z.next_center[0], z.next_center[1], 0.0]) <= z.next_radius - NEXT_ZONE_MARGIN
 }
 
 /// A drop is zone-safe when it is inside the current zone and, if the shrink
@@ -308,28 +407,19 @@ fn drop_zone_safe(obs: &Obs, pos: [f64; 3], eta: f64) -> bool {
 
 /// Remembered items of `kind` seen within `fresh_s`, skipping ids in `seen`
 /// (the visible copy wins).
-fn remembered<'a, M: MemView>(
-    obs: &Obs,
-    mem: &'a M,
-    kind: ItemKind,
-    fresh_s: f64,
-    seen: &[u32],
-) -> impl Iterator<Item = &'a RememberedItem> {
+fn remembered<'a, M: MemView>(obs: &Obs, mem: &'a M, kind: ItemKind, fresh_s: f64, seen: &[u32]) -> impl Iterator<Item = &'a RememberedItem> {
     let t = obs.t;
     let seen = seen.to_vec();
-    mem.items().iter().filter(move |it| {
-        it.kind == kind && t - it.last_seen_t <= fresh_s && !seen.contains(&it.id)
-    })
+    mem.items()
+        .iter()
+        .filter(move |it| it.kind == kind && t - it.last_seen_t <= fresh_s && !seen.contains(&it.id))
 }
 
 /// Weapon pickups in view plus fresh remembered ones: `(id, kind, pos)`.
 fn weapon_candidates<M: MemView>(obs: &Obs, mem: &M) -> Vec<(u32, WeaponKind, [f64; 3])> {
     let mut out: Vec<_> = obs.pickups.iter().map(|p| (p.id, p.kind, p.pos)).collect();
     let seen: Vec<u32> = out.iter().map(|c| c.0).collect();
-    out.extend(
-        remembered(obs, mem, ItemKind::Weapon, WEAPON_FRESH_S, &seen)
-            .filter_map(|it| it.weapon_kind.map(|k| (it.id, k, it.pos))),
-    );
+    out.extend(remembered(obs, mem, ItemKind::Weapon, WEAPON_FRESH_S, &seen).filter_map(|it| it.weapon_kind.map(|k| (it.id, k, it.pos))));
     out
 }
 
@@ -351,19 +441,14 @@ fn better(best: &mut Option<ItemGoal>, g: ItemGoal) {
     }
 }
 
-fn pick_drop<N: NavView, M: MemView>(
-    obs: &Obs,
-    nav: &N,
-    mem: &M,
-    genome: &ApexGenome,
-) -> Option<ItemGoal> {
+fn pick_drop<N: NavView, M: MemView>(obs: &Obs, nav: &N, mem: &M, genome: &ApexGenome, threats: &[ThreatInfo]) -> Option<ItemGoal> {
     let (max_d, slack) = match genome.drop_contest {
         DropContest::Off => return None,
         DropContest::HealOnly95 => {
             if hp_frac(obs) >= 0.95 {
                 return None;
             }
-            (250.0, 8.0)
+            (160.0, 6.0)
         }
         DropContest::AlwaysUncontested => (280.0, 6.0),
     };
@@ -376,7 +461,7 @@ fn pick_drop<N: NavView, M: MemView>(
         }
         let ours_or_free = d.holder.is_none() || d.holder == Some(obs.me.id);
         let contest_ok = match genome.drop_contest {
-            DropContest::HealOnly95 => ours_or_free || d.progress < 0.5 * d.capture_s,
+            DropContest::HealOnly95 => (ours_or_free || d.progress < 0.5 * d.capture_s) && !threats.iter().any(|t| !t.is_ghost && dist2d(t.pos, d.pos) < 70.0),
             _ => ours_or_free,
         };
         let eta = dist / walk_speed(obs);
@@ -397,12 +482,7 @@ fn pick_drop<N: NavView, M: MemView>(
     best
 }
 
-fn pick_kill_cube<N: NavView, M: MemView>(
-    obs: &Obs,
-    nav: &N,
-    mem: &M,
-    genome: &ApexGenome,
-) -> Option<ItemGoal> {
+fn pick_kill_cube<N: NavView, M: MemView>(obs: &Obs, nav: &N, mem: &M, genome: &ApexGenome) -> Option<ItemGoal> {
     if obs.t - mem.kill_t() > 4.0 || obs.me.cubes >= genome.cube_cap {
         return None;
     }
@@ -410,10 +490,7 @@ fn pick_kill_cube<N: NavView, M: MemView>(
     let me = obs.me.pos;
     let mut best = None;
     for (id, pos) in item_candidates(obs, mem, ItemKind::Cube) {
-        if dist2d(pos, kill) > 95.0
-            || (pos[2] - kill[2]).abs() >= 4.0
-            || !item_ok(obs, nav, mem, id, pos)
-        {
+        if dist2d(pos, kill) > 95.0 || (pos[2] - kill[2]).abs() >= 4.0 || !item_ok(obs, nav, mem, id, pos) {
             continue;
         }
         let dist = dist2d(pos, me);
@@ -431,22 +508,12 @@ fn pick_kill_cube<N: NavView, M: MemView>(
     best
 }
 
-fn pick_fight_detour<N: NavView, M: MemView>(
-    obs: &Obs,
-    nav: &N,
-    mem: &M,
-    genome: &ApexGenome,
-    threats: &[ThreatInfo],
-) -> Option<ItemGoal> {
+fn pick_fight_detour<N: NavView, M: MemView>(obs: &Obs, nav: &N, mem: &M, genome: &ApexGenome, threats: &[ThreatInfo]) -> Option<ItemGoal> {
     let me = obs.me.pos;
     let nearest = threats.iter().min_by(|a, b| a.dist.total_cmp(&b.dist));
     let mut best = None;
     if obs.me.cubes < genome.cube_cap && genome.fight_cube_r > 0.0 {
-        let r = if hp_frac(obs) < 0.5 {
-            genome.fight_cube_r * 0.5
-        } else {
-            genome.fight_cube_r
-        };
+        let r = if hp_frac(obs) < 0.5 { genome.fight_cube_r * 0.5 } else { genome.fight_cube_r };
         for (id, pos) in item_candidates(obs, mem, ItemKind::Cube) {
             let dist = dist2d(pos, me);
             // Safer than the nearest threat: we reach it before they do.
@@ -468,54 +535,34 @@ fn pick_fight_detour<N: NavView, M: MemView>(
     }
     // Gun-only with a lull in the fight: a wanted laser is worth a longer walk.
     let gun_only = !holds(obs, WeaponKind::Laser) && !holds(obs, WeaponKind::Lightning);
-    let lull = !threats
-        .iter()
-        .any(|t| t.dist < 50.0 || obs.t - t.last_hit_us_t < 2.0);
-    let laser_r = if gun_only && lull {
-        genome.laser_seek_r.min(120.0)
-    } else {
-        0.0
-    };
-    if obs.me.weapons.iter().any(Option::is_none) {
-        for (id, kind, pos) in weapon_candidates(obs, mem) {
-            let dist = dist2d(pos, me);
-            let reach = if kind == WeaponKind::Laser {
-                laser_r.max(45.0)
-            } else {
-                45.0
-            };
-            if dist > reach
-                || take_plan(obs, genome.weapon_pref, kind).is_none()
-                || !item_ok(obs, nav, mem, id, pos)
-            {
-                continue;
-            }
-            let score = 520.0 + f64::from(weapon_rank(genome.weapon_pref, kind)) - dist;
-            better(
-                &mut best,
-                ItemGoal {
-                    kind: ItemKind::Weapon,
-                    id,
-                    pos,
-                    score,
-                    stand_off: 0.0,
-                },
-            );
+    let lull = !threats.iter().any(|t| t.dist < 50.0 || obs.t - t.last_hit_us_t < 2.0);
+    let laser_r = if gun_only && lull { genome.laser_seek_r.min(120.0) } else { 0.0 };
+    for (id, kind, pos) in weapon_candidates(obs, mem) {
+        let dist = dist2d(pos, me);
+        let reach = if kind == WeaponKind::Laser { laser_r.max(45.0) } else { 45.0 };
+        if dist > reach || take_plan(obs, genome.weapon_pref, kind).is_none() || raced(obs, threats, pos, dist) || !item_ok(obs, nav, mem, id, pos) {
+            continue;
         }
+        let score = 520.0 + f64::from(weapon_rank(genome.weapon_pref, kind)) - dist;
+        better(
+            &mut best,
+            ItemGoal {
+                kind: ItemKind::Weapon,
+                id,
+                pos,
+                score,
+                stand_off: 0.0,
+            },
+        );
     }
     best
 }
 
-/// No enemy mech within 150 m, seen in the last 5 s.
-fn area_quiet(obs: &Obs, threats: &[ThreatInfo]) -> bool {
+/// No enemy mech within `r` meters, seen within `seen_s` seconds (or visible now).
+fn quiet_within(obs: &Obs, threats: &[ThreatInfo], r: f64, seen_s: f64) -> bool {
     let me = obs.me.pos;
-    let recent = threats
-        .iter()
-        .any(|t| obs.t - t.last_seen_t <= 5.0 && dist2d(t.pos, me) <= 150.0);
-    let visible = obs
-        .mechs
-        .iter()
-        .any(|m| m.is_mech() && m.id != obs.me.id && dist2d(m.pos, me) <= 150.0);
+    let recent = threats.iter().any(|t| obs.t - t.last_seen_t <= seen_s && dist2d(t.pos, me) <= r);
+    let visible = obs.mechs.iter().any(|m| m.is_mech() && m.id != obs.me.id && dist2d(m.pos, me) <= r);
     !recent && !visible
 }
 
@@ -532,38 +579,63 @@ fn farm_zone_ok(obs: &Obs, pos: [f64; 3]) -> bool {
     early && dist2d(pos, [z.center[0], z.center[1], 0.0]) <= z.radius - 15.0
 }
 
-fn pick_calm<N: NavView, M: MemView>(
-    obs: &Obs,
-    nav: &N,
-    mem: &M,
-    genome: &ApexGenome,
-    threats: &[ThreatInfo],
-) -> Option<ItemGoal> {
+fn pick_calm<N: NavView, M: MemView>(obs: &Obs, nav: &N, mem: &M, genome: &ApexGenome, threats: &[ThreatInfo]) -> Option<ItemGoal> {
     let me = obs.me.pos;
     let pref = genome.weapon_pref;
     let top = top_wanted(pref);
+    let stealth = mem.is_ffa() || genome.quiet_walk;
+    let has_laser = holds(obs, WeaponKind::Laser);
+    let (cube_cap, crate_cap, npc_cap, weapon_cap, laser_cap) = if !stealth {
+        (
+            PRACTICE_CUBE_CAP,
+            PRACTICE_CRATE_CAP,
+            PRACTICE_NPC_CAP,
+            PRACTICE_WEAPON_CAP,
+            genome.laser_seek_r,
+        )
+    } else if has_laser {
+        (
+            FFA_ARMED_CUBE_CAP,
+            FFA_ARMED_CRATE_CAP,
+            FFA_ARMED_NPC_CAP,
+            FFA_WEAPON_CAP,
+            genome.laser_seek_r.min(FFA_LASER_CAP),
+        )
+    } else {
+        (
+            FFA_UNARMED_CUBE_CAP,
+            FFA_UNARMED_CRATE_CAP,
+            FFA_UNARMED_NPC_CAP,
+            FFA_WEAPON_CAP,
+            genome.laser_seek_r.min(FFA_LASER_CAP),
+        )
+    };
     // Only a gun (or nothing) in hand: grab any secondary fast.
     let unarmed = obs.me.weapons[1].is_none();
+    // In stealth/FFA, never walk past a threat for loot or weapons.
+    let exposed = |pos: [f64; 3]| stealth && corridor_blocked(obs, threats, pos);
     let mut best = None;
     for (id, kind, pos) in weapon_candidates(obs, mem) {
         let dist = dist2d(pos, me);
-        if take_plan(obs, pref, kind).is_none() || !item_ok(obs, nav, mem, id, pos) {
+        let is_laser = kind == WeaponKind::Laser;
+        let max_d = if is_laser { laser_cap } else { weapon_cap };
+        if dist > max_d || take_plan(obs, pref, kind).is_none() || !next_zone_ok(obs, pos) || !item_ok(obs, nav, mem, id, pos) {
             continue;
         }
-        let base = if kind == top && dist <= genome.laser_seek_r {
+        if is_laser && raced(obs, threats, pos, dist) {
+            continue;
+        }
+        if exposed(pos) {
+            continue;
+        }
+        let base = if kind == top && dist <= laser_cap {
             // Early rush for the weapon the build is centred on.
             800.0 - 0.5 * dist
-        } else if dist <= 150.0 {
-            300.0 + f64::from(weapon_rank(pref, kind)) - dist
         } else {
-            continue;
+            300.0 + f64::from(weapon_rank(pref, kind)) - dist
         };
         let secondary = matches!(kind, WeaponKind::Laser | WeaponKind::Lightning);
-        let score = if unarmed && secondary {
-            base + UNARMED_SECONDARY_BONUS
-        } else {
-            base
-        };
+        let score = if unarmed && secondary { base + UNARMED_SECONDARY_BONUS } else { base };
         better(
             &mut best,
             ItemGoal {
@@ -578,7 +650,7 @@ fn pick_calm<N: NavView, M: MemView>(
     if obs.me.cubes < genome.cube_cap {
         for (id, pos) in item_candidates(obs, mem, ItemKind::Cube) {
             let dist = dist2d(pos, me);
-            if !item_ok(obs, nav, mem, id, pos) {
+            if dist > cube_cap || !next_zone_ok(obs, pos) || raced(obs, threats, pos, dist) || exposed(pos) || !item_ok(obs, nav, mem, id, pos) {
                 continue;
             }
             better(
@@ -593,17 +665,20 @@ fn pick_calm<N: NavView, M: MemView>(
             );
         }
     }
-    if hp_frac(obs) >= genome.farm_hp_min && area_quiet(obs, threats) {
-        let npc_stand = if holds(obs, WeaponKind::Lightning) {
-            25.0
-        } else {
-            45.0
-        };
+    let farm_ok = if !stealth {
+        !(unarmed && obs.t < 3.0) && hp_frac(obs) >= genome.farm_hp_min && quiet_within(obs, threats, 150.0, 5.0)
+    } else if has_laser {
+        obs.t < 150.0 && hp_frac(obs) >= genome.farm_hp_min.max(0.70) && quiet_within(obs, threats, 130.0, 6.0)
+    } else {
+        obs.t >= 3.0 && hp_frac(obs) >= genome.farm_hp_min && quiet_within(obs, threats, 95.0, 5.0)
+    };
+    if farm_ok {
+        let npc_stand = if holds(obs, WeaponKind::Lightning) { 25.0 } else { 45.0 };
         for n in obs.mechs.iter().filter(|m| m.kind == ActorKind::Npc) {
-            if !farm_zone_ok(obs, n.pos) || !item_ok(obs, nav, mem, n.id, n.pos) {
+            let dist = dist2d(n.pos, me);
+            if dist > npc_cap || !next_zone_ok(obs, n.pos) || !farm_zone_ok(obs, n.pos) || exposed(n.pos) || !item_ok(obs, nav, mem, n.id, n.pos) {
                 continue;
             }
-            let dist = dist2d(n.pos, me);
             better(
                 &mut best,
                 ItemGoal {
@@ -616,10 +691,10 @@ fn pick_calm<N: NavView, M: MemView>(
             );
         }
         for (id, pos) in item_candidates(obs, mem, ItemKind::Crate) {
-            if !farm_zone_ok(obs, pos) || !item_ok(obs, nav, mem, id, pos) {
+            let dist = dist2d(pos, me);
+            if dist > crate_cap || !next_zone_ok(obs, pos) || !farm_zone_ok(obs, pos) || exposed(pos) || !item_ok(obs, nav, mem, id, pos) {
                 continue;
             }
-            let dist = dist2d(pos, me);
             better(
                 &mut best,
                 ItemGoal {
@@ -635,15 +710,8 @@ fn pick_calm<N: NavView, M: MemView>(
     best
 }
 
-fn loot_or_farm<N: NavView, M: MemView>(
-    obs: &Obs,
-    nav: &N,
-    mem: &M,
-    genome: &ApexGenome,
-    in_fight: bool,
-    threats: &[ThreatInfo],
-) -> Option<ItemGoal> {
-    pick_drop(obs, nav, mem, genome)
+fn loot_or_farm<N: NavView, M: MemView>(obs: &Obs, nav: &N, mem: &M, genome: &ApexGenome, in_fight: bool, threats: &[ThreatInfo]) -> Option<ItemGoal> {
+    pick_drop(obs, nav, mem, genome, threats)
         .or_else(|| pick_kill_cube(obs, nav, mem, genome))
         .or_else(|| {
             if in_fight {
@@ -657,14 +725,7 @@ fn loot_or_farm<N: NavView, M: MemView>(
 /// The item, drop, or farm target worth going for now, if any. Priority:
 /// supply drop, then the cubes of a fresh kill, then a mid-fight detour or
 /// calm looting and farming.
-pub fn choose_loot_or_farm(
-    obs: &Obs,
-    nav: &ApexNav,
-    mem: &BotMemory,
-    genome: &ApexGenome,
-    in_fight: bool,
-    threats: &[ThreatInfo],
-) -> Option<ItemGoal> {
+pub fn choose_loot_or_farm(obs: &Obs, nav: &ApexNav, mem: &BotMemory, genome: &ApexGenome, in_fight: bool, threats: &[ThreatInfo]) -> Option<ItemGoal> {
     loot_or_farm(obs, nav, mem, genome, in_fight, threats)
 }
 
@@ -696,9 +757,8 @@ fn zone_core<N: NavView>(obs: &Obs, nav: &N) -> (bool, bool, [f64; 3]) {
     let d_cur = (me[0] - z.center[0]).hypot(me[1] - z.center[1]);
     let outside_next = d_next > next_r;
 
-    let zone_must = !obs.me.in_zone
-        || (shrinking && z.radius - d_cur <= 8.0)
-        || (outside_next && ((shrinking && to_end <= eta) || (to_start > 0.0 && to_start <= eta)));
+    let zone_must =
+        !obs.me.in_zone || (shrinking && z.radius - d_cur <= 8.0) || (outside_next && ((shrinking && to_end <= eta) || (to_start > 0.0 && to_start <= eta)));
     let zone_should = d_next > safe_r + 10.0 && to_start <= eta + 14.0;
     (zone_must, zone_should, safe)
 }
@@ -712,20 +772,21 @@ pub fn zone_assessment(obs: &Obs, nav: &ApexNav) -> (bool, bool, [f64; 3]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::{
-        ActorObs, DropObs, GunStats, ItemObs, LaserStats, LightningStats, Offer, OfferChoice,
-        PickupObs,
-    };
+    use proto::{ActorObs, DropObs, GunStats, ItemObs, LaserStats, LightningStats, Offer, OfferChoice, PickupObs};
 
     struct Nav {
         reach: bool,
+        ground: f64,
     }
     impl NavView for Nav {
         fn reachable(&self, _: [f64; 3], _: [f64; 3]) -> bool {
             self.reach
         }
         fn ground_z(&self, _: f64, _: f64) -> f64 {
-            0.0
+            self.ground
+        }
+        fn is_main_xy(&self, _: f64, _: f64) -> bool {
+            self.reach
         }
     }
 
@@ -734,6 +795,7 @@ mod tests {
         kill_t: f64,
         kill_pos: Option<[f64; 3]>,
         items: Vec<RememberedItem>,
+        ffa: bool,
     }
     impl MemView for Mem {
         fn blacklisted(&self, id: u32, _: f64) -> bool {
@@ -748,9 +810,12 @@ mod tests {
         fn items(&self) -> &[RememberedItem] {
             &self.items
         }
+        fn is_ffa(&self) -> bool {
+            self.ffa
+        }
     }
 
-    const NAV: Nav = Nav { reach: true };
+    const NAV: Nav = Nav { reach: true, ground: 0.0 };
 
     fn mem() -> Mem {
         Mem {
@@ -758,16 +823,11 @@ mod tests {
             kill_t: f64::NEG_INFINITY,
             kill_pos: None,
             items: vec![],
+            ffa: false,
         }
     }
 
-    fn remembered_item(
-        id: u32,
-        kind: ItemKind,
-        weapon_kind: Option<WeaponKind>,
-        pos: [f64; 3],
-        last_seen_t: f64,
-    ) -> RememberedItem {
+    fn remembered_item(id: u32, kind: ItemKind, weapon_kind: Option<WeaponKind>, pos: [f64; 3], last_seen_t: f64) -> RememberedItem {
         RememberedItem {
             id,
             kind,
@@ -801,10 +861,7 @@ mod tests {
     }
 
     fn base_obs() -> Obs {
-        let mut o = Obs {
-            t: 10.0,
-            ..Default::default()
-        };
+        let mut o = Obs { t: 10.0, ..Default::default() };
         o.me.id = 1;
         o.me.hp = 1400.0;
         o.me.max_hp = 1400.0;
@@ -913,10 +970,7 @@ mod tests {
         let mut o = base_obs();
         let mut g = genome();
         g.weapon_pref = WeaponPref::GunLaser;
-        o.pickups = vec![
-            pickup(5, WeaponKind::Mortar, [1.0, 0.0, 0.0]),
-            pickup(6, WeaponKind::Laser, [3.0, 0.0, 0.0]),
-        ];
+        o.pickups = vec![pickup(5, WeaponKind::Mortar, [1.0, 0.0, 0.0]), pickup(6, WeaponKind::Laser, [3.0, 0.0, 0.0])];
         assert_eq!(pick_weapon_action(&o, &g), (Some(6), None));
         // Out of reach vertically.
         o.pickups[1].pos[2] = 5.0;
@@ -933,17 +987,8 @@ mod tests {
 
     #[test]
     fn weapon_action_never_drops_gun_with_slot_one_empty() {
-        let kinds = [
-            WeaponKind::Gun,
-            WeaponKind::Laser,
-            WeaponKind::Lightning,
-            WeaponKind::Mortar,
-        ];
-        for pref in [
-            WeaponPref::GunLaser,
-            WeaponPref::LaserLightningDropGun,
-            WeaponPref::GunLightning,
-        ] {
+        let kinds = [WeaponKind::Gun, WeaponKind::Laser, WeaponKind::Lightning, WeaponKind::Mortar];
+        for pref in [WeaponPref::GunLaser, WeaponPref::LaserLightningDropGun, WeaponPref::GunLightning] {
             let mut g = genome();
             g.weapon_pref = pref;
             for kind in kinds {
@@ -952,11 +997,7 @@ mod tests {
                 o.pickups = vec![pickup(8, kind, [1.0, 0.0, 0.0])];
                 let (take, drop) = pick_weapon_action(&o, &g);
                 assert_eq!(drop, None, "{pref:?} dropped a slot for {kind:?}");
-                assert_eq!(
-                    take.is_some(),
-                    kind != WeaponKind::Gun && kind != WeaponKind::Mortar,
-                    "{pref:?} with {kind:?}"
-                );
+                assert_eq!(take.is_some(), kind != WeaponKind::Gun && kind != WeaponKind::Mortar, "{pref:?} with {kind:?}");
             }
         }
     }
@@ -970,10 +1011,7 @@ mod tests {
         g.laser_seek_r = 200.0;
         o.pickups = vec![pickup(6, WeaponKind::Laser, [-100.0, 0.0, 0.0])];
         let far = [threat([90.0, 0.0, 0.0], 90.0, 10.0)];
-        assert_eq!(
-            loot_or_farm(&o, &NAV, &mem(), &g, true, &far).map(|i| i.id),
-            Some(6)
-        );
+        assert_eq!(loot_or_farm(&o, &NAV, &mem(), &g, true, &far).map(|i| i.id), Some(6));
         // A close threat or a recent hit keeps us in the fight.
         let close = [threat([40.0, 0.0, 0.0], 40.0, 10.0)];
         assert!(loot_or_farm(&o, &NAV, &mem(), &g, true, &close).is_none());
@@ -1021,24 +1059,26 @@ mod tests {
             holder: None,
         }];
         g.drop_contest = DropContest::Off;
-        assert!(
-            loot_or_farm(&o, &NAV, &mem(), &g, false, &[]).is_none_or(|i| i.kind != ItemKind::Drop)
-        );
+        assert!(loot_or_farm(&o, &NAV, &mem(), &g, false, &[]).is_none_or(|i| i.kind != ItemKind::Drop));
         g.drop_contest = DropContest::AlwaysUncontested;
         let goal = loot_or_farm(&o, &NAV, &mem(), &g, false, &[]).unwrap();
-        assert_eq!(
-            (goal.kind, goal.id, goal.stand_off),
-            (ItemKind::Drop, 40, 0.0)
-        );
+        assert_eq!((goal.kind, goal.id, goal.stand_off), (ItemKind::Drop, 40, 0.0));
         o.drops[0].holder = Some(77);
-        assert!(pick_drop(&o, &NAV, &mem(), &g).is_none());
+        assert!(pick_drop(&o, &NAV, &mem(), &g, &[]).is_none());
         g.drop_contest = DropContest::HealOnly95;
-        assert!(pick_drop(&o, &NAV, &mem(), &g).is_none());
+        assert!(pick_drop(&o, &NAV, &mem(), &g, &[]).is_none());
         o.me.hp = 0.8 * o.me.max_hp;
-        assert!(pick_drop(&o, &NAV, &mem(), &g).is_some());
+        assert!(pick_drop(&o, &NAV, &mem(), &g, &[]).is_some());
+        // Threat within 70 m of the drop rejects HealOnly95.
+        let near_drop = [threat([100.0, 0.0, 0.0], 100.0, 10.0)];
+        assert!(pick_drop(&o, &NAV, &mem(), &g, &near_drop).is_none());
+        // Drop beyond 160 m rejects HealOnly95.
+        o.drops[0].pos = [170.0, 0.0, 0.0];
+        assert!(pick_drop(&o, &NAV, &mem(), &g, &[]).is_none());
+        o.drops[0].pos = [50.0, 0.0, 0.0];
         // Lands far too late to wait for.
         o.drops[0].lands_in = 60.0;
-        assert!(pick_drop(&o, &NAV, &mem(), &g).is_none());
+        assert!(pick_drop(&o, &NAV, &mem(), &g, &[]).is_none());
     }
 
     #[test]
@@ -1050,17 +1090,14 @@ mod tests {
         o.cubes = vec![item(20, [10.0, 0.0, 0.0]), item(21, [30.0, 0.0, 0.0])];
         let goal = loot_or_farm(&o, &NAV, &mem(), &g, false, &[]).unwrap();
         assert_eq!((goal.kind, goal.id), (ItemKind::Cube, 20));
-        let m = Mem {
-            black: vec![20],
-            ..mem()
-        };
+        let m = Mem { black: vec![20], ..mem() };
         assert_eq!(loot_or_farm(&o, &NAV, &m, &g, false, &[]).unwrap().id, 21);
         o.me.cubes = 8;
         assert!(loot_or_farm(&o, &NAV, &mem(), &g, false, &[]).is_none());
         // Unreachable cube on a roof is skipped.
         o.me.cubes = 0;
         o.cubes = vec![item(22, [10.0, 0.0, 9.0])];
-        assert!(loot_or_farm(&o, &Nav { reach: false }, &mem(), &g, false, &[]).is_none());
+        assert!(loot_or_farm(&o, &Nav { reach: false, ground: 0.0 }, &mem(), &g, false, &[]).is_none());
         // Outside the current zone margin.
         o.cubes = vec![item(23, [497.0, 0.0, 0.0])];
         assert!(loot_or_farm(&o, &NAV, &mem(), &g, false, &[]).is_none());
@@ -1082,10 +1119,7 @@ mod tests {
         let goal = loot_or_farm(&o, &NAV, &m, &g, true, &[]).unwrap();
         assert_eq!((goal.kind, goal.id), (ItemKind::Cube, 30));
         let stale = Mem { kill_t: 1.0, ..m };
-        assert_eq!(
-            loot_or_farm(&o, &NAV, &stale, &g, false, &[]).unwrap().id,
-            6
-        );
+        assert_eq!(loot_or_farm(&o, &NAV, &stale, &g, false, &[]).unwrap().id, 6);
     }
 
     #[test]
@@ -1151,35 +1185,17 @@ mod tests {
         g.weapon_pref = WeaponPref::GunLaser;
         // Nothing in view; a laser seen 10 s ago behind us.
         let m = Mem {
-            items: vec![remembered_item(
-                70,
-                ItemKind::Weapon,
-                Some(WeaponKind::Laser),
-                [-60.0, 0.0, 0.0],
-                0.0,
-            )],
+            items: vec![remembered_item(70, ItemKind::Weapon, Some(WeaponKind::Laser), [-60.0, 0.0, 0.0], 0.0)],
             ..mem()
         };
         let goal = loot_or_farm(&o, &NAV, &m, &g, false, &[]).unwrap();
-        assert_eq!(
-            (goal.kind, goal.id, goal.pos),
-            (ItemKind::Weapon, 70, [-60.0, 0.0, 0.0])
-        );
+        assert_eq!((goal.kind, goal.id, goal.pos), (ItemKind::Weapon, 70, [-60.0, 0.0, 0.0]));
         // Also reached for mid-fight in a lull.
         let far = [threat([90.0, 0.0, 0.0], 90.0, 10.0)];
-        assert_eq!(
-            loot_or_farm(&o, &NAV, &m, &g, true, &far).map(|i| i.id),
-            Some(70)
-        );
+        assert_eq!(loot_or_farm(&o, &NAV, &m, &g, true, &far).map(|i| i.id), Some(70));
         // A weapon memory without a known kind is ignored.
         let unknown = Mem {
-            items: vec![remembered_item(
-                71,
-                ItemKind::Weapon,
-                None,
-                [-60.0, 0.0, 0.0],
-                0.0,
-            )],
+            items: vec![remembered_item(71, ItemKind::Weapon, None, [-60.0, 0.0, 0.0], 0.0)],
             ..mem()
         };
         assert!(loot_or_farm(&o, &NAV, &unknown, &g, false, &[]).is_none());
@@ -1198,19 +1214,10 @@ mod tests {
         g.weapon_pref = WeaponPref::GunLaser;
         o.pickups = vec![pickup(70, WeaponKind::Laser, [30.0, 0.0, 0.0])];
         let m = Mem {
-            items: vec![remembered_item(
-                70,
-                ItemKind::Weapon,
-                Some(WeaponKind::Laser),
-                [-60.0, 0.0, 0.0],
-                9.0,
-            )],
+            items: vec![remembered_item(70, ItemKind::Weapon, Some(WeaponKind::Laser), [-60.0, 0.0, 0.0], 9.0)],
             ..mem()
         };
-        assert_eq!(
-            loot_or_farm(&o, &NAV, &m, &g, false, &[]).unwrap().pos,
-            [30.0, 0.0, 0.0]
-        );
+        assert_eq!(loot_or_farm(&o, &NAV, &m, &g, false, &[]).unwrap().pos, [30.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -1220,13 +1227,7 @@ mod tests {
         g.drop_contest = DropContest::Off;
         g.cube_cap = 8;
         let m = Mem {
-            items: vec![remembered_item(
-                80,
-                ItemKind::Cube,
-                None,
-                [20.0, 0.0, 0.0],
-                0.0,
-            )],
+            items: vec![remembered_item(80, ItemKind::Cube, None, [20.0, 0.0, 0.0], 0.0)],
             ..mem()
         };
         let goal = loot_or_farm(&o, &NAV, &m, &g, false, &[]).unwrap();
@@ -1246,10 +1247,7 @@ mod tests {
             ..mem()
         };
         let goal = loot_or_farm(&o, &NAV, &kill, &g, true, &[]).unwrap();
-        assert_eq!(
-            (goal.kind, goal.id, goal.score),
-            (ItemKind::Cube, 80, 880.0)
-        );
+        assert_eq!((goal.kind, goal.id, goal.score), (ItemKind::Cube, 80, 880.0));
         // Stale beyond 35 s.
         o.t = 36.0;
         assert!(loot_or_farm(&o, &NAV, &m, &g, false, &[]).is_none());
@@ -1258,20 +1256,11 @@ mod tests {
         o.t = 10.0;
         o.me.weapons = [Some(gun()), Some(laser(0.0))];
         let crates = Mem {
-            items: vec![remembered_item(
-                90,
-                ItemKind::Crate,
-                None,
-                [40.0, 0.0, 0.0],
-                0.0,
-            )],
+            items: vec![remembered_item(90, ItemKind::Crate, None, [40.0, 0.0, 0.0], 0.0)],
             ..mem()
         };
         let goal = loot_or_farm(&o, &NAV, &crates, &g, false, &[]).unwrap();
-        assert_eq!(
-            (goal.kind, goal.id, goal.stand_off),
-            (ItemKind::Crate, 90, 26.0)
-        );
+        assert_eq!((goal.kind, goal.id, goal.stand_off), (ItemKind::Crate, 90, 26.0));
         o.t = 46.0;
         assert!(loot_or_farm(&o, &NAV, &crates, &g, false, &[]).is_none());
     }
@@ -1289,6 +1278,281 @@ mod tests {
         o.cubes = vec![item(20, [5.0, 0.0, 0.0])];
         let goal = loot_or_farm(&o, &NAV, &mem(), &g, false, &[]).unwrap();
         assert_eq!((goal.id, goal.score), (6, 365.0));
+    }
+
+    fn calm_genome() -> ApexGenome {
+        let mut g = genome();
+        g.drop_contest = DropContest::Off;
+        g.weapon_pref = WeaponPref::GunLaser;
+        g.cube_cap = 8;
+        g.farm_hp_min = 0.0;
+        g.laser_seek_r = 260.0;
+        g
+    }
+
+    fn npc_at(id: u32, pos: [f64; 3]) -> ActorObs {
+        ActorObs {
+            id,
+            kind: ActorKind::Npc,
+            pos,
+            vel: [0.0; 3],
+            aim: [0.0; 2],
+            hp: None,
+            max_hp: None,
+            cubes: None,
+            weapons: None,
+            charging: None,
+        }
+    }
+
+    fn calm(o: &Obs, m: &Mem, g: &ApexGenome, threats: &[ThreatInfo]) -> Option<(ItemKind, u32)> {
+        pick_calm(o, &NAV, m, g, threats).map(|i| (i.kind, i.id))
+    }
+
+    #[test]
+    fn calm_caps_are_tighter_in_ffa() {
+        let g = calm_genome();
+        let practice = mem();
+        let ffa = Mem { ffa: true, ..mem() };
+        let armed = |mut o: Obs| {
+            o.me.weapons = [Some(gun()), Some(laser(0.0))];
+            o
+        };
+        // Cube at 100 m: inside the 110 m practice cap, past the 80 m/65 m FFA caps.
+        let mut o = armed(base_obs());
+        o.cubes = vec![item(20, [100.0, 0.0, 0.0])];
+        assert_eq!(calm(&o, &practice, &g, &[]), Some((ItemKind::Cube, 20)));
+        assert_eq!(calm(&o, &ffa, &g, &[]), None);
+        o.cubes[0].pos = [115.0, 0.0, 0.0];
+        assert_eq!(calm(&o, &practice, &g, &[]), None);
+        // Armed with laser: cube cap is 65 m in FFA (75 m skipped, 60 m taken); unarmed is 80 m.
+        o.cubes[0].pos = [75.0, 0.0, 0.0];
+        assert_eq!(calm(&o, &ffa, &g, &[]), None);
+        o.cubes[0].pos = [60.0, 0.0, 0.0];
+        assert_eq!(calm(&o, &ffa, &g, &[]), Some((ItemKind::Cube, 20)));
+        let mut ou = base_obs();
+        ou.cubes = vec![item(20, [75.0, 0.0, 0.0])];
+        assert_eq!(calm(&ou, &ffa, &g, &[]), Some((ItemKind::Cube, 20)));
+
+        // Crate at 80 m: practice only (past 75 m/60 m FFA caps).
+        let mut o = armed(base_obs());
+        o.crates = vec![item(60, [80.0, 0.0, 0.0])];
+        assert_eq!(calm(&o, &practice, &g, &[]), Some((ItemKind::Crate, 60)));
+        assert_eq!(calm(&o, &ffa, &g, &[]), None);
+        // Armed with laser: crate at 55 m allowed if t < 150, hp >= 0.70, quiet 130 m/6 s.
+        o.crates[0].pos = [55.0, 0.0, 0.0];
+        assert_eq!(calm(&o, &ffa, &g, &[]), Some((ItemKind::Crate, 60)));
+        o.t = 155.0;
+        assert_eq!(calm(&o, &ffa, &g, &[]), None);
+        o.t = 10.0;
+        o.me.hp = 0.65 * o.me.max_hp;
+        assert_eq!(calm(&o, &ffa, &g, &[]), None);
+        o.me.hp = o.me.max_hp;
+        let far_watcher = [threat([-120.0, 0.0, 0.0], 120.0, 5.0)];
+        assert_eq!(calm(&o, &ffa, &g, &far_watcher), None);
+
+        // NPC at 100 m: practice only (past 65 m armed FFA cap). 60 m: both.
+        let mut o = armed(base_obs());
+        o.mechs = vec![npc_at(50, [100.0, 0.0, 0.0])];
+        assert_eq!(calm(&o, &practice, &g, &[]), Some((ItemKind::Npc, 50)));
+        assert_eq!(calm(&o, &ffa, &g, &[]), None);
+        o.mechs[0].pos = [60.0, 0.0, 0.0];
+        assert_eq!(calm(&o, &ffa, &g, &[]), Some((ItemKind::Npc, 50)));
+
+        // Laser at 250 m: within laser_seek_r (260 m), past the 240 m FFA/stealth ceiling.
+        let mut o = base_obs();
+        o.pickups = vec![pickup(6, WeaponKind::Laser, [250.0, 0.0, 0.0])];
+        assert_eq!(calm(&o, &practice, &g, &[]), Some((ItemKind::Weapon, 6)));
+        assert_eq!(calm(&o, &ffa, &g, &[]), None);
+        let mut gq = calm_genome();
+        gq.quiet_walk = true;
+        assert_eq!(calm(&o, &practice, &gq, &[]), None, "quiet_walk uses stealth laser cap");
+        o.pickups[0].pos = [230.0, 0.0, 0.0];
+        assert_eq!(calm(&o, &practice, &gq, &[]), Some((ItemKind::Weapon, 6)));
+        o.pickups[0].pos = [270.0, 0.0, 0.0];
+        assert_eq!(calm(&o, &practice, &g, &[]), None);
+
+        // Lightning (not the top weapon) at 130 m: practice only (past 120 m FFA weapon cap). 110 m: both.
+        let mut o = base_obs();
+        o.pickups = vec![pickup(7, WeaponKind::Lightning, [130.0, 0.0, 0.0])];
+        assert_eq!(calm(&o, &practice, &g, &[]), Some((ItemKind::Weapon, 7)));
+        assert_eq!(calm(&o, &ffa, &g, &[]), None);
+        o.pickups[0].pos = [110.0, 0.0, 0.0];
+        assert_eq!(calm(&o, &ffa, &g, &[]), Some((ItemKind::Weapon, 7)));
+        // A top-ranked lightning still obeys the 120 m FFA weapon cap.
+        let mut gl = calm_genome();
+        gl.weapon_pref = WeaponPref::GunLightning;
+        o.pickups[0].pos = [130.0, 0.0, 0.0];
+        assert_eq!(calm(&o, &practice, &gl, &[]), Some((ItemKind::Weapon, 7)));
+        assert_eq!(calm(&o, &ffa, &gl, &[]), None);
+    }
+
+    #[test]
+    fn roof_items_are_rejected() {
+        let mut o = base_obs();
+        let g = calm_genome();
+        o.me.weapons = [Some(gun()), Some(laser(0.0))];
+        // 2 m up on flat ground: a roof (step_up 1.2 + 0.5 = 1.7).
+        o.cubes = vec![item(20, [20.0, 0.0, 2.0])];
+        assert!(pick_calm(&o, &NAV, &mem(), &g, &[]).is_none());
+        // Even when the nav would call it reachable and it is within LEVEL_DZ.
+        assert!(!item_ok(&o, &NAV, &mem(), 20, [20.0, 0.0, 2.0]));
+        // On a hill: the terrain rises with it.
+        let hill = Nav { reach: true, ground: 2.0 };
+        assert_eq!(pick_calm(&o, &hill, &mem(), &g, &[]).map(|i| i.id), Some(20));
+        // We stand on the same roof: fine below ground + 3.2.
+        o.me.pos[2] = 1.5;
+        assert_eq!(pick_calm(&o, &NAV, &mem(), &g, &[]).map(|i| i.id), Some(20));
+        // A bigger step_up raises the bar up to ground + 3.2.
+        o.me.pos[2] = 0.0;
+        o.me.stats.step_up = 2.0;
+        assert_eq!(pick_calm(&o, &NAV, &mem(), &g, &[]).map(|i| i.id), Some(20));
+        // Anything above ground + 3.2 is ALWAYS rejected even if we are elevated or step_up is large.
+        o.me.pos[2] = 2.0;
+        o.me.stats.step_up = 4.0;
+        o.cubes = vec![item(21, [20.0, 0.0, 3.3])];
+        assert!(!item_ok(&o, &NAV, &mem(), 21, [20.0, 0.0, 3.3]));
+        assert!(pick_calm(&o, &NAV, &mem(), &g, &[]).is_none());
+        // Weapon pickups too, including on real ApexNav with a roof building.
+        o.me.pos[2] = 0.0;
+        o.me.stats.step_up = 1.2;
+        o.cubes.clear();
+        o.me.weapons = [Some(gun()), None];
+        o.pickups = vec![pickup(6, WeaponKind::Laser, [30.0, 0.0, 6.0])];
+        assert!(pick_calm(&o, &NAV, &mem(), &g, &[]).is_none());
+
+        let mut w = world::World::flat(100.0);
+        w.prisms
+            .push(world::Prism::rect(world::PrismKind::Building, [20.0, -5.0], [30.0, 5.0], 0.0, 4.0));
+        let nav = ApexNav::build(std::sync::Arc::new(w), &proto::MechStats::default(), &proto::VisionCfg::default());
+        o.pickups = vec![pickup(8, WeaponKind::Laser, [25.0, 0.0, 4.0])];
+        assert!(pick_calm(&o, &nav, &mem(), &g, &[]).is_none());
+    }
+
+    #[test]
+    fn lasers_and_cubes_lost_to_a_nearer_threat_are_skipped() {
+        let g = calm_genome();
+        let mut o = base_obs();
+        o.pickups = vec![pickup(6, WeaponKind::Laser, [100.0, 0.0, 0.0])];
+        // Threat 20 m from the laser, we are 100 m away.
+        let near = [threat([100.0, 20.0, 0.0], 102.0, 8.0)];
+        assert!(calm(&o, &mem(), &g, &near).is_none());
+        // Seen more than 5 s ago: no longer counted.
+        let old = [threat([100.0, 20.0, 0.0], 102.0, 4.9)];
+        assert_eq!(calm(&o, &mem(), &g, &old), Some((ItemKind::Weapon, 6)));
+        // A ghost does not race.
+        let mut ghost = near;
+        ghost[0].is_ghost = true;
+        assert_eq!(calm(&o, &mem(), &g, &ghost), Some((ItemKind::Weapon, 6)));
+        // Farther from the item than we are: fine.
+        let far = [threat([-50.0, 0.0, 0.0], 50.0, 9.0)];
+        assert_eq!(calm(&o, &mem(), &g, &far), Some((ItemKind::Weapon, 6)));
+        // Cubes too.
+        let mut o = base_obs();
+        o.me.weapons = [Some(gun()), Some(laser(0.0))];
+        o.cubes = vec![item(20, [40.0, 0.0, 0.0])];
+        let near = [threat([40.0, 10.0, 0.0], 41.0, 9.0)];
+        assert!(calm(&o, &mem(), &g, &near).is_none());
+        // Mid-fight weapon detours check the race too.
+        let mut o = base_obs();
+        let mut g = calm_genome();
+        g.laser_seek_r = 200.0;
+        o.pickups = vec![pickup(6, WeaponKind::Laser, [-100.0, 0.0, 0.0])];
+        let racer = [threat([-100.0, 60.0, 0.0], 116.0, 10.0)];
+        assert!(pick_fight_detour(&o, &NAV, &mem(), &g, &racer).is_none());
+    }
+
+    #[test]
+    fn ffa_skips_calm_loot_past_a_threat() {
+        let g = calm_genome();
+        let ffa = Mem { ffa: true, ..mem() };
+        let mut o = base_obs();
+        o.me.weapons = [Some(gun()), Some(laser(0.0))];
+        o.cubes = vec![item(20, [60.0, 0.0, 0.0])];
+        // Threat 48 m off the path's midpoint, farther from the cube than we
+        // are (no race), but the walk closes on it (< CORRIDOR_R = 55 m).
+        let side = [threat([20.0, 48.0, 0.0], 52.0, 9.0)];
+        assert!(calm(&o, &ffa, &g, &side).is_none());
+        assert_eq!(calm(&o, &mem(), &g, &side), Some((ItemKind::Cube, 20)), "practice ignores it");
+        // Threat behind us: the path never nears it more than it already is.
+        let behind = [threat([-60.0, 0.0, 0.0], 60.0, 9.0)];
+        assert_eq!(calm(&o, &ffa, &g, &behind), Some((ItemKind::Cube, 20)));
+        // Path clear by more than 55 m.
+        let wide = [threat([60.0, 60.0, 0.0], 84.85, 9.0)];
+        assert_eq!(calm(&o, &ffa, &g, &wide), Some((ItemKind::Cube, 20)));
+        // Stale (>= 4 s) threats do not block.
+        let stale = [threat([20.0, 48.0, 0.0], 52.0, 5.9)];
+        assert_eq!(calm(&o, &ffa, &g, &stale), Some((ItemKind::Cube, 20)));
+        // Stealth/FFA skips ALL exposed weapons (even when unarmed, including lasers).
+        let mut o = base_obs();
+        o.pickups = vec![pickup(7, WeaponKind::Lightning, [60.0, 0.0, 0.0])];
+        assert!(calm(&o, &ffa, &g, &side).is_none());
+        let mut gq = calm_genome();
+        gq.quiet_walk = true;
+        assert!(calm(&o, &mem(), &gq, &side).is_none(), "quiet_walk also skips exposed weapons");
+        o.me.weapons = [Some(lightning()), Some(gun())];
+        o.pickups = vec![pickup(8, WeaponKind::Laser, [60.0, 0.0, 0.0])];
+        assert!(calm(&o, &ffa, &g, &side).is_none(), "lasers are also skipped when exposed");
+        assert!(calm(&o, &mem(), &gq, &side).is_none());
+        let mut gl = calm_genome();
+        gl.weapon_pref = WeaponPref::GunLightning;
+        let mut o = base_obs();
+        o.me.weapons = [Some(gun()), Some(laser(0.0))];
+        o.pickups = vec![pickup(7, WeaponKind::Lightning, [60.0, 0.0, 0.0])];
+        assert!(calm(&o, &ffa, &gl, &side).is_none(), "armed: no detour past a threat");
+        assert_eq!(calm(&o, &mem(), &gl, &side), Some((ItemKind::Weapon, 7)));
+    }
+
+    #[test]
+    fn unarmed_skips_early_farming_and_fight_detour_upgrades_secondary() {
+        let g = calm_genome();
+        let mut o = base_obs();
+        o.t = 1.5;
+        o.crates = vec![item(60, [20.0, 0.0, 0.0])];
+        o.mechs = vec![npc_at(50, [30.0, 0.0, 0.0])];
+        assert!(calm(&o, &mem(), &g, &[]).is_none(), "unarmed skips crate/npc farm before t = 3.0");
+        o.t = 3.5;
+        assert_eq!(calm(&o, &mem(), &g, &[]), Some((ItemKind::Npc, 50)));
+
+        // Fight detour upgrades Lightning -> Laser even when slot 1 is occupied.
+        let mut o = base_obs();
+        o.me.weapons = [Some(gun()), Some(lightning())];
+        o.pickups = vec![pickup(6, WeaponKind::Laser, [30.0, 0.0, 0.0])];
+        let far = [threat([90.0, 0.0, 0.0], 90.0, 10.0)];
+        assert_eq!(loot_or_farm(&o, &NAV, &mem(), &g, true, &far).map(|i| i.id), Some(6));
+    }
+
+    #[test]
+    fn calm_loot_waits_inside_the_next_zone_before_a_shrink() {
+        let g = calm_genome();
+        let mut o = base_obs();
+        o.me.weapons = [Some(gun()), Some(laser(0.0))];
+        o.zone.next_center = [0.0, 0.0];
+        o.zone.next_radius = 50.0;
+        o.cubes = vec![item(20, [45.0, 0.0, 0.0])];
+        // 90 s before the shrink: anything in the current zone goes.
+        assert_eq!(calm(&o, &mem(), &g, &[]), Some((ItemKind::Cube, 20)));
+        // 20 s before: the cube is only 5 m inside the next circle.
+        o.t = 80.0;
+        assert!(calm(&o, &mem(), &g, &[]).is_none());
+        o.cubes[0].pos = [39.0, 0.0, 0.0];
+        assert_eq!(calm(&o, &mem(), &g, &[]), Some((ItemKind::Cube, 20)));
+        // Weapons, crates, and NPCs are gated too.
+        o.cubes.clear();
+        o.pickups = vec![pickup(7, WeaponKind::Lightning, [45.0, 0.0, 0.0])];
+        o.me.weapons = [Some(gun()), None];
+        assert!(calm(&o, &mem(), &g, &[]).is_none());
+        o.pickups.clear();
+        o.me.weapons = [Some(gun()), Some(laser(0.0))];
+        o.crates = vec![item(60, [45.0, 0.0, 0.0])];
+        o.mechs = vec![npc_at(50, [0.0, 45.0, 0.0])];
+        assert!(calm(&o, &mem(), &g, &[]).is_none());
+        // No next circle yet: no gate.
+        o.zone.next_radius = 0.0;
+        o.crates.clear();
+        o.mechs.clear();
+        o.cubes = vec![item(20, [45.0, 0.0, 0.0])];
+        assert_eq!(calm(&o, &mem(), &g, &[]), Some((ItemKind::Cube, 20)));
     }
 
     #[test]

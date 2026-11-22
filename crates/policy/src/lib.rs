@@ -48,9 +48,7 @@ impl Policy for Idle {
 }
 
 /// Every built-in policy `make` knows.
-pub const NAMES: &[&str] = &[
-    "apex", "aggro", "survive", "hide", "roof", "example", "idle",
-];
+pub const NAMES: &[&str] = &["apex", "aggro", "survive", "hide", "roof", "example", "idle"];
 
 /// Builds the policy called `name`, or `None` for a name [`is_known`] rejects.
 /// Any policy also takes `@key=value/...` [`Params`] overrides on top of
@@ -69,9 +67,7 @@ pub fn make(name: &str, params: &Params) -> Option<Box<dyn Policy>> {
     match name {
         "example" => Some(Box::new(Example::new(params.clone()))),
         "idle" => Some(Box::new(Idle)),
-        _ => {
-            Strategy::parse(name).map(|s| Box::new(Cbot::new(s, params.clone())) as Box<dyn Policy>)
-        }
+        _ => Strategy::parse(name).map(|s| Box::new(Cbot::new(s, params.clone())) as Box<dyn Policy>),
     }
 }
 
@@ -84,9 +80,7 @@ pub fn is_known(name: &str) -> bool {
         return ApexGenome::default().with_overrides(spec).is_ok();
     }
     match name.split_once('@') {
-        Some((base, spec)) => {
-            NAMES.contains(&base) && Params::default().with_overrides(spec).is_ok()
-        }
+        Some((base, spec)) => NAMES.contains(&base) && Params::default().with_overrides(spec).is_ok(),
         None => NAMES.contains(&name),
     }
 }

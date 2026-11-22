@@ -55,19 +55,11 @@ impl Params {
     /// Values are clamped into [`Params::BOUNDS`].
     pub fn from_json(text: &str) -> Result<Params, String> {
         let value: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        let map = value
-            .as_object()
-            .ok_or("a params file holds one JSON object")?;
+        let map = value.as_object().ok_or("a params file holds one JSON object")?;
         let mut values = Params::default().to_vec();
         for (key, v) in map {
-            let index = Params::NAMES
-                .iter()
-                .position(|n| n == key)
-                .ok_or_else(|| format!("unknown param {key:?}"))?;
-            values[index] = v
-                .as_f64()
-                .ok_or_else(|| format!("param {key:?} is not a number"))?
-                as f32;
+            let index = Params::NAMES.iter().position(|n| n == key).ok_or_else(|| format!("unknown param {key:?}"))?;
+            values[index] = v.as_f64().ok_or_else(|| format!("param {key:?} is not a number"))? as f32;
         }
         Params::from_vec(&values).ok_or_else(|| "a param is NaN".into())
     }
@@ -80,16 +72,9 @@ impl Params {
     pub fn with_overrides(&self, spec: &str) -> Result<Params, String> {
         let mut values = self.to_vec();
         for kv in spec.split('/').filter(|kv| !kv.is_empty()) {
-            let (key, v) = kv
-                .split_once('=')
-                .ok_or_else(|| format!("{kv:?} is not key=value"))?;
-            let index = Params::NAMES
-                .iter()
-                .position(|n| *n == key)
-                .ok_or_else(|| format!("unknown param {key:?}"))?;
-            values[index] = v
-                .parse()
-                .map_err(|_| format!("param {key:?}: {v:?} is not a number"))?;
+            let (key, v) = kv.split_once('=').ok_or_else(|| format!("{kv:?} is not key=value"))?;
+            let index = Params::NAMES.iter().position(|n| *n == key).ok_or_else(|| format!("unknown param {key:?}"))?;
+            values[index] = v.parse().map_err(|_| format!("param {key:?}: {v:?} is not a number"))?;
         }
         Params::from_vec(&values).ok_or_else(|| "a param is NaN".into())
     }
@@ -331,9 +316,7 @@ mod tests {
 
     #[test]
     fn overrides_set_named_fields_and_reject_unknown_keys() {
-        let p = Params::default()
-            .with_overrides("recover_on=1/lead_lag_s=0.075")
-            .unwrap();
+        let p = Params::default().with_overrides("recover_on=1/lead_lag_s=0.075").unwrap();
         assert_eq!((p.recover_on, p.lead_lag_s), (1.0, 0.075));
         assert_eq!(p.engage_range, Params::default().engage_range);
         assert!(Params::default().with_overrides("nope=1").is_err());

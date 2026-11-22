@@ -23,9 +23,7 @@ struct Peek {
 }
 
 fn send<T: serde::Serialize>(out: &mut impl Write, message: &T) {
-    let Ok(mut line) = serde_json::to_vec(message) else {
-        return;
-    };
+    let Ok(mut line) = serde_json::to_vec(message) else { return };
     line.push(b'\n');
     if out.write_all(&line).and_then(|()| out.flush()).is_err() {
         std::process::exit(0);
@@ -42,34 +40,23 @@ impl Bot {
     fn hello(&mut self, line: &[u8], out: &mut impl Write) {
         match serde_json::from_slice::<Hello>(line) {
             Ok(hello) => {
-                eprintln!(
-                    "bot: slot {} map {} protocol {}",
-                    hello.slot, hello.map.dir, hello.protocol
-                );
+                eprintln!("bot: slot {} map {} protocol {}", hello.slot, hello.map.dir, hello.protocol);
                 if catch_unwind(AssertUnwindSafe(|| self.policy.on_hello(&hello))).is_err() {
                     eprintln!("bot: the policy panicked in on_hello");
                 }
             }
             Err(e) => eprintln!("bot: hello does not parse, playing on defaults: {e}"),
         }
-        let name: String = self
-            .policy
-            .name()
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(32)
-            .collect();
+        let name: String = self.policy.name().chars().filter(|c| !c.is_control()).take(32).collect();
         send(out, &Ready { name });
     }
 
     fn decide(&mut self, line: &[u8], tick: u32, out: &mut impl Write) {
         let mut action = match serde_json::from_slice::<Obs>(line) {
-            Ok(obs) => {
-                catch_unwind(AssertUnwindSafe(|| self.policy.act(&obs))).unwrap_or_else(|_| {
-                    eprintln!("bot: the policy panicked at tick {tick}, coasting");
-                    self.last.coast(tick)
-                })
-            }
+            Ok(obs) => catch_unwind(AssertUnwindSafe(|| self.policy.act(&obs))).unwrap_or_else(|_| {
+                eprintln!("bot: the policy panicked at tick {tick}, coasting");
+                self.last.coast(tick)
+            }),
             Err(e) => {
                 eprintln!("bot: observation at tick {tick} does not parse, coasting: {e}");
                 self.last.coast(tick)
@@ -166,9 +153,7 @@ fn main() {
             }
         };
         pending.extend_from_slice(&chunk[..n]);
-        let Some(end) = pending.iter().rposition(|&b| b == b'\n') else {
-            continue;
-        };
+        let Some(end) = pending.iter().rposition(|&b| b == b'\n') else { continue };
 
         let lines: Vec<(&[u8], Peek)> = pending[..end]
             .split(|&b| b == b'\n')

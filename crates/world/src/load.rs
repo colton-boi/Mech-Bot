@@ -76,11 +76,7 @@ struct RawTable {
 }
 
 fn points(flat: &[f64]) -> Vec<[f64; 2]> {
-    flat.as_chunks::<2>()
-        .0
-        .iter()
-        .map(|p| [p[0], p[1]])
-        .collect()
+    flat.as_chunks::<2>().0.iter().map(|p| [p[0], p[1]]).collect()
 }
 
 impl World {
@@ -88,8 +84,7 @@ impl World {
     pub fn load(dir: &Path) -> Result<World, WorldError> {
         let json_path = dir.join("v2/world.json");
         let text = std::fs::read(&json_path).map_err(|e| WorldError::Io(json_path.clone(), e))?;
-        let raw: RawWorld =
-            serde_json::from_slice(&text).map_err(|e| WorldError::Json(json_path, e))?;
+        let raw: RawWorld = serde_json::from_slice(&text).map_err(|e| WorldError::Json(json_path, e))?;
 
         let terrain_path = dir.join("v2").join(&raw.terrain.file);
         let bytes = std::fs::read(&terrain_path).map_err(|e| WorldError::Io(terrain_path, e))?;
@@ -113,15 +108,7 @@ impl World {
         let prisms = raw
             .prisms
             .iter()
-            .map(|p| {
-                Prism::new(
-                    p.kind,
-                    p.base,
-                    p.top,
-                    points(&p.ring),
-                    p.holes.iter().map(|h| points(h)).collect(),
-                )
-            })
+            .map(|p| Prism::new(p.kind, p.base, p.top, points(&p.ring), p.holes.iter().map(|h| points(h)).collect()))
             .collect();
 
         let column = |name: &str| {
@@ -132,8 +119,7 @@ impl World {
                 .ok_or_else(|| WorldError::Format(format!("trees lack column {name}")))
         };
         let (x, y, z, height) = (column("x")?, column("y")?, column("z")?, column("height")?);
-        let (crown_r, crown_base, trunk_r) =
-            (column("crownR")?, column("crownBase")?, column("trunkR")?);
+        let (crown_r, crown_base, trunk_r) = (column("crownR")?, column("crownBase")?, column("trunkR")?);
         let (crown_x, crown_y) = (column("crownX")?, column("crownY")?);
         let trees = raw
             .trees

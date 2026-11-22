@@ -34,10 +34,7 @@ pub struct Action {
 
 impl Action {
     pub fn new(tick: u32) -> Self {
-        Self {
-            tick,
-            ..Self::default()
-        }
+        Self { tick, ..Self::default() }
     }
 
     /// Replaces non-finite numbers, which JSON cannot carry, so the line stays schema-valid.

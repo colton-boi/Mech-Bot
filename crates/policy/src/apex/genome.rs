@@ -227,6 +227,7 @@ impl ApexGenome {
         "lance_duel",
         "sr_ironclad",
         "selective_vulture",
+        "practice",
     ];
 
     /// Forces every gene into its bounds. A NaN or infinite number takes the
@@ -242,10 +243,8 @@ impl ApexGenome {
         self.exposure_weight = bounded(self.exposure_weight, EXPOSURE_WEIGHT, d.exposure_weight);
         self.crowd_pen = bounded(self.crowd_pen, CROWD_PEN, d.crowd_pen);
         self.retreat_hp = bounded(self.retreat_hp, RETREAT_HP, d.retreat_hp);
-        self.retreat_exit_hp = bounded(self.retreat_exit_hp, RETREAT_EXIT_HP, d.retreat_exit_hp)
-            .max(self.retreat_hp + RETREAT_GAP);
-        self.multi_retreat_hp =
-            bounded(self.multi_retreat_hp, MULTI_RETREAT_HP, d.multi_retreat_hp);
+        self.retreat_exit_hp = bounded(self.retreat_exit_hp, RETREAT_EXIT_HP, d.retreat_exit_hp).max(self.retreat_hp + RETREAT_GAP);
+        self.multi_retreat_hp = bounded(self.multi_retreat_hp, MULTI_RETREAT_HP, d.multi_retreat_hp);
         self.laser_range = bounded(self.laser_range, LASER_RANGE, d.laser_range);
         self.gun_range = bounded(self.gun_range, GUN_RANGE, d.gun_range);
         self.dodge_weight = bounded(self.dodge_weight, DODGE_WEIGHT, d.dodge_weight);
@@ -254,8 +253,7 @@ impl ApexGenome {
         } else if self.laser_lethal_k < LASER_LETHAL_K.0 / 2.0 {
             0.0
         } else {
-            self.laser_lethal_k
-                .clamp(LASER_LETHAL_K.0, LASER_LETHAL_K.1)
+            self.laser_lethal_k.clamp(LASER_LETHAL_K.0, LASER_LETHAL_K.1)
         };
         self.laser_seek_r = bounded(self.laser_seek_r, LASER_SEEK_R, d.laser_seek_r);
         self.fight_cube_r = bounded(self.fight_cube_r, FIGHT_CUBE_R, d.fight_cube_r);
@@ -273,9 +271,7 @@ impl ApexGenome {
     /// wrong type is an error, so a stale file is not half-applied. The result
     /// is clamped.
     pub fn from_json(text: &str) -> Result<Self, String> {
-        serde_json::from_str::<Self>(text)
-            .map(Self::clamped)
-            .map_err(|e| e.to_string())
+        serde_json::from_str::<Self>(text).map(Self::clamped).map_err(|e| e.to_string())
     }
 
     /// Reads a genome file with [`ApexGenome::from_json`].
@@ -300,8 +296,7 @@ impl ApexGenome {
     ///
     /// An unknown key, preset or value is an error. The result is clamped.
     pub fn with_overrides(&self, spec: &str) -> Result<Self, String> {
-        let starts_item =
-            |s: &str| s.contains('=') || s.starts_with("preset:") || s.starts_with("file:");
+        let starts_item = |s: &str| s.contains('=') || s.starts_with("preset:") || s.starts_with("file:");
         let segments: Vec<&str> = spec.split('/').collect();
         let mut genome = self.clone();
         let mut i = 0;
@@ -322,9 +317,7 @@ impl ApexGenome {
                 }
                 genome = Self::load_file(std::path::Path::new(&path))?;
             } else {
-                let (key, value) = segment
-                    .split_once('=')
-                    .ok_or_else(|| format!("{segment:?} is not key=value"))?;
+                let (key, value) = segment.split_once('=').ok_or_else(|| format!("{segment:?} is not key=value"))?;
                 genome = genome.with_gene(key, value)?;
             }
         }
@@ -336,12 +329,8 @@ impl ApexGenome {
     fn with_gene(&self, key: &str, value: &str) -> Result<Self, String> {
         use serde_json::Value;
         let mut json = serde_json::to_value(self).map_err(|e| e.to_string())?;
-        let map = json
-            .as_object_mut()
-            .ok_or("a genome serializes to a JSON object")?;
-        let slot = map
-            .get_mut(key)
-            .ok_or_else(|| format!("unknown gene {key:?}"))?;
+        let map = json.as_object_mut().ok_or("a genome serializes to a JSON object")?;
+        let slot = map.get_mut(key).ok_or_else(|| format!("unknown gene {key:?}"))?;
         let bad = || format!("gene {key:?}: {value:?} is not a valid value");
         *slot = match slot {
             Value::Bool(_) => Value::Bool(match value {
@@ -367,20 +356,22 @@ impl ApexGenome {
     }
 
     /// The genome for practice lobbies (score = 16 − place, mostly duels):
-    /// fight readily, retreat in short pulses, and switch to the FFA posture
-    /// when an FFA is detected.
+    /// the aggressive profile — engage out to 190 m, laser econ, heal-only
+    /// drops, 1.5 s lose-rule retreat pulses, long laser band, no peek, and
+    /// fight cubes within 70 m. It never switches posture itself; [`super::Apex`]
+    /// runs it until an FFA is detected when the FFA genome has `ffa_switch`.
     pub fn practice_default() -> Self {
         Self {
             weapon_pref: WeaponPref::GunLaser,
             upgrade_profile: UpgradeProfile::LaserEcon,
             cube_cap: 10,
-            drop_contest: DropContest::HealOnly95,
-            ffa_switch: true,
-            engage_radius: 160.0,
+            drop_contest: DropContest::AlwaysUncontested,
+            ffa_switch: false,
+            engage_radius: 190.0,
             lone_only: false,
             quiet_walk: false,
             home_ring_frac: 0.55,
-            exposure_weight: 40.0,
+            exposure_weight: 30.0,
             crowd_pen: 20.0,
             retreat_mode: RetreatMode::Pulse15s,
             retreat_hp: 0.35,
@@ -388,59 +379,62 @@ impl ApexGenome {
             multi_retreat_hp: 0.55,
             commit_no_cover: true,
             rear_turn: true,
-            laser_range: 120.0,
-            gun_range: 85.0,
+            laser_range: 125.0,
+            gun_range: 95.0,
             strafe_style: StrafeStyle::Steady35s,
             hit_flip: true,
-            dodge_weight: 4.0,
+            dodge_weight: 5.0,
             laser_juke_mode: LaserJukeMode::StrafeBoost,
-            laser_peek: true,
-            laser_lethal_k: 0.75,
+            laser_peek: false,
+            laser_lethal_k: 0.80,
             laser_retreat_dump: true,
             gun_lead_mode: GunLeadMode::Standard10,
-            laser_seek_r: 240.0,
+            laser_seek_r: 260.0,
             fight_cube_r: 70.0,
-            farm_hp_min: 0.55,
+            farm_hp_min: 0.50,
             cdwin_push: true,
         }
     }
 
-    /// The genome for FFA matches: the evolved winner (`evo2` gen 1, cand 10):
-    /// gun beside laser, smart-heal defense upgrades, fast-jink strafe with
-    /// hit-flip, a tight 60 m engage radius, a low-exposure mid-ring hold,
-    /// latched retreat, damped gun lead, and no drop contests or cube grabs.
+    /// The genome for FFA matches (`s5_hybrid_def` baseline): gun beside laser,
+    /// defense-first upgrades, no drop contests, a 75 m lone-only engage radius,
+    /// quiet walk, a low-exposure hold inside 0.65 of the next radius, latched
+    /// 0.40/0.82 (multi 0.65) retreat, steady 3-5 s strafe with hit-flip, laser
+    /// peek + damped 0.82 gun lead, 240 m laser seek, and 40 m fight cubes.
+    /// With `ffa_switch` the bot plays [`ApexGenome::practice_default`] in 1v1 duels or
+    /// after an opening window until an FFA is detected.
     pub fn ffa_default() -> Self {
         Self {
             weapon_pref: WeaponPref::GunLaser,
-            upgrade_profile: UpgradeProfile::SmartHealDefense,
+            upgrade_profile: UpgradeProfile::DefenseFirst,
             cube_cap: 10,
             drop_contest: DropContest::Off,
-            ffa_switch: false,
-            engage_radius: 60.0,
-            lone_only: false,
+            ffa_switch: true,
+            engage_radius: 75.0,
+            lone_only: true,
             quiet_walk: true,
-            home_ring_frac: 0.5548,
+            home_ring_frac: 0.65,
             exposure_weight: 120.0,
             crowd_pen: 40.0,
             retreat_mode: RetreatMode::Latched,
-            retreat_hp: 0.38,
-            retreat_exit_hp: 0.7771,
-            multi_retreat_hp: 0.5728,
+            retreat_hp: 0.40,
+            retreat_exit_hp: 0.82,
+            multi_retreat_hp: 0.65,
             commit_no_cover: false,
-            rear_turn: false,
-            laser_range: 85.0,
-            gun_range: 70.0,
-            strafe_style: StrafeStyle::FastJink,
+            rear_turn: true,
+            laser_range: 115.0,
+            gun_range: 75.0,
+            strafe_style: StrafeStyle::Steady35s,
             hit_flip: true,
-            dodge_weight: 5.9185,
+            dodge_weight: 6.0,
             laser_juke_mode: LaserJukeMode::StrafeBoost,
             laser_peek: true,
-            laser_lethal_k: 0.8004,
-            laser_retreat_dump: false,
+            laser_lethal_k: 0.80,
+            laser_retreat_dump: true,
             gun_lead_mode: GunLeadMode::Damped082,
-            laser_seek_r: 174.3022,
-            fight_cube_r: 0.0,
-            farm_hp_min: 0.7,
+            laser_seek_r: 240.0,
+            fight_cube_r: 40.0,
+            farm_hp_min: 0.75,
             cdwin_push: false,
         }
     }
@@ -720,6 +714,8 @@ impl ApexGenome {
                 farm_hp_min: 0.75,
                 cdwin_push: false,
             },
+            // Pure practice play (no FFA switch), for `apex@preset:practice`.
+            "practice" => Self::practice_default(),
             _ => return None,
         };
         Some(genome.clamped())
@@ -731,34 +727,21 @@ mod tests {
     use super::*;
 
     fn json_name<T: Serialize>(v: T) -> String {
-        serde_json::to_value(v)
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_string()
+        serde_json::to_value(v).unwrap().as_str().unwrap().to_string()
     }
 
     #[test]
     fn enum_names_are_exact() {
         assert_eq!(json_name(WeaponPref::GunLaser), "gun_laser");
-        assert_eq!(
-            json_name(WeaponPref::LaserLightningDropGun),
-            "laser_lightning_drop_gun"
-        );
+        assert_eq!(json_name(WeaponPref::LaserLightningDropGun), "laser_lightning_drop_gun");
         assert_eq!(json_name(WeaponPref::GunLightning), "gun_lightning");
         assert_eq!(json_name(UpgradeProfile::DefenseFirst), "defense_first");
         assert_eq!(json_name(UpgradeProfile::LaserEcon), "laser_econ");
         assert_eq!(json_name(UpgradeProfile::GunMagBrawl), "gun_mag_brawl");
-        assert_eq!(
-            json_name(UpgradeProfile::SmartHealDefense),
-            "smart_heal_defense"
-        );
+        assert_eq!(json_name(UpgradeProfile::SmartHealDefense), "smart_heal_defense");
         assert_eq!(json_name(DropContest::Off), "off");
         assert_eq!(json_name(DropContest::HealOnly95), "heal_only_95");
-        assert_eq!(
-            json_name(DropContest::AlwaysUncontested),
-            "always_uncontested"
-        );
+        assert_eq!(json_name(DropContest::AlwaysUncontested), "always_uncontested");
         assert_eq!(json_name(RetreatMode::Latched), "latched");
         assert_eq!(json_name(RetreatMode::Pulse15s), "pulse_1_5s");
         assert_eq!(json_name(RetreatMode::TtlLastStand), "ttl_last_stand");
@@ -770,21 +753,14 @@ mod tests {
         assert_eq!(json_name(LaserJukeMode::BreakLosCover), "break_los_cover");
         assert_eq!(json_name(GunLeadMode::Standard10), "standard_1_0");
         assert_eq!(json_name(GunLeadMode::Damped082), "damped_0_82");
-        assert_eq!(
-            json_name(GunLeadMode::AccelHitfbBandit),
-            "accel_hitfb_bandit"
-        );
+        assert_eq!(json_name(GunLeadMode::AccelHitfbBandit), "accel_hitfb_bandit");
         let alias: DropContest = serde_json::from_str("\"heal_only95\"").unwrap();
         assert_eq!(alias, DropContest::HealOnly95);
     }
 
     #[test]
     fn defaults_and_presets_are_clamped_and_round_trip() {
-        let mut all = vec![
-            ApexGenome::default(),
-            ApexGenome::practice_default(),
-            ApexGenome::ffa_default(),
-        ];
+        let mut all = vec![ApexGenome::default(), ApexGenome::practice_default(), ApexGenome::ffa_default()];
         for name in ApexGenome::PRESET_NAMES {
             all.push(ApexGenome::preset(name).unwrap_or_else(|| panic!("preset {name} missing")));
         }
@@ -796,6 +772,9 @@ mod tests {
         }
         assert!(ApexGenome::preset("nope").is_none());
         assert_eq!(ApexGenome::default(), ApexGenome::ffa_default());
+        assert_eq!(ApexGenome::preset("practice"), Some(ApexGenome::practice_default()));
+        assert!(!ApexGenome::practice_default().ffa_switch);
+        assert!(ApexGenome::ffa_default().ffa_switch);
     }
 
     #[test]
@@ -836,8 +815,7 @@ mod tests {
     fn json_rejects_unknown_and_fills_missing() {
         assert!(ApexGenome::from_json(r#"{"bogus": 1}"#).is_err());
         assert!(ApexGenome::from_json(r#"{"retreat_mode": "sideways"}"#).is_err());
-        let g =
-            ApexGenome::from_json(r#"{"engage_radius": 500, "strafe_style": "mid_1_2s"}"#).unwrap();
+        let g = ApexGenome::from_json(r#"{"engage_radius": 500, "strafe_style": "mid_1_2s"}"#).unwrap();
         assert_eq!(g.engage_radius, 190.0);
         assert_eq!(g.strafe_style, StrafeStyle::Mid12s);
         assert_eq!(g.cube_cap, ApexGenome::ffa_default().cube_cap);
@@ -874,10 +852,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("g.json");
         std::fs::write(&path, r#"{"laser_range": 150, "rear_turn": false}"#).unwrap();
-        let spec = format!(
-            "preset:sr_ironclad/file:{}/engage_radius=70",
-            path.display()
-        );
+        let spec = format!("preset:sr_ironclad/file:{}/engage_radius=70", path.display());
         let g = ApexGenome::default().with_overrides(&spec).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(g.laser_range, 150.0);

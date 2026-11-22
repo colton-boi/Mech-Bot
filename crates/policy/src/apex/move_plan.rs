@@ -11,9 +11,7 @@
 use super::genome::{ApexGenome, LaserJukeMode, StrafeStyle};
 use super::memory::BotMemory;
 use super::nav::ApexNav;
-use super::types::{
-    clamp, dist_xy, wrap_pi, ItemKind, Mode, MoveDecision, NavGoal, Rng64, ThreatInfo,
-};
+use super::types::{clamp, dist_xy, wrap_pi, ItemKind, Mode, MoveDecision, NavGoal, Rng64, ThreatInfo};
 use proto::{Obs, ProjectileKind, WeaponKind, WeaponObs};
 use std::f64::consts::PI;
 use world::{Bounds, NO_HINT};
@@ -57,6 +55,15 @@ const MAX_CHARGERS: usize = 2;
 const MAX_WATCHERS: usize = 2;
 const MAX_CUBES: usize = 16;
 const MAX_ARC_THREATS: usize = 4;
+const MAX_SEP: usize = 4;
+/// FFA: threats closer than this are kept apart from and hidden from, meters.
+const SEP_RANGE: f64 = 145.0;
+/// Radius of the ring sampled to find a peekable LOS edge, meters.
+const PEEK_RING_M: f64 = 6.0;
+/// Velocity-continuity bonus is off this long after a strafe flip, seconds.
+const FLIP_SETTLE_S: f64 = 0.3;
+/// The final shrink: a next radius this small pins us to its center, meters.
+const FINAL_RADIUS: f64 = 12.0;
 
 // ---------------------------------------------------------------------------
 // The planner's view of the map and of memory.
@@ -132,10 +139,7 @@ struct Points<const N: usize> {
 
 impl<const N: usize> Points<N> {
     fn new() -> Self {
-        Self {
-            pts: [[0.0; 2]; N],
-            len: 0,
-        }
+        Self { pts: [[0.0; 2]; N], len: 0 }
     }
     fn push(&mut self, p: [f64; 2]) {
         if self.len < N {
@@ -198,6 +202,33 @@ fn laser_aimed_at(t: &ThreatInfo, at: [f64; 2]) -> bool {
     wrap_pi(to[1].atan2(to[0]) - t.aim[0]).abs() <= LASER_AIM_TOL
 }
 
+/// A LOS edge to `body` lies within reach of `pos`: sampling `pos` and a ring
+/// of [`PEEK_RING_M`] around it finds both a spot that sees `body` and one
+/// that does not. In an open field there is nothing to peek from.
+fn peek_edge_nearby<E: MoveEnv>(env: &E, pos: [f64; 3], eye_h: f64, body: [f64; 3], hint: &mut u32) -> bool {
+    let (mut seen, mut hidden) = (false, false);
+    for k in 0..=8 {
+        let p = if k == 0 {
+            xy(pos)
+        } else {
+            let a = (k - 1) as f64 * (PI / 4.0);
+            [pos[0] + PEEK_RING_M * a.cos(), pos[1] + PEEK_RING_M * a.sin()]
+        };
+        if k > 0 && !env.walkable(p[0], p[1]) {
+            continue;
+        }
+        if env.los([p[0], p[1], pos[2] + eye_h], body, hint) {
+            seen = true;
+        } else {
+            hidden = true;
+        }
+        if seen && hidden {
+            return true;
+        }
+    }
+    false
+}
+
 /// Strafe leg bounds in seconds and the chance to flip at a leg's end.
 fn cadence(style: StrafeStyle) -> (f64, f64, f64) {
     match style {
@@ -218,37 +249,68 @@ struct RangeBand {
     lightning: bool,
 }
 
-fn preferred_range(obs: &Obs, genome: &ApexGenome, target: &ThreatInfo) -> RangeBand {
+/// Matchup-aware: our weapons against the target's, finishing a weak target
+/// up close in Practice, and standing off when a crowd is near.
+fn preferred_range(obs: &Obs, mem_ffa: bool, genome: &ApexGenome, target: &ThreatInfo, threats: &[ThreatInfo]) -> RangeBand {
+    let ffa_posture = mem_ffa || (genome.quiet_walk && obs.alive > 3);
     let have_lightning = own_holds(obs, WeaponKind::Lightning);
     let enemy_lightning = threat_holds(target, WeaponKind::Lightning);
+    let healthy = obs.me.max_hp <= 0.0 || obs.me.hp >= 0.5 * obs.me.max_hp;
+    let others_within = |r: f64| {
+        threats
+            .iter()
+            .filter(|th| th.id != target.id && !th.is_ghost && obs.t - th.last_seen_t < 3.0 && th.dist < r)
+            .count()
+    };
     let mut band = RangeBand {
         pref: genome.gun_range,
         cdwin: false,
         lightning: false,
     };
-    if have_lightning && obs.me.energy > 30.0 && (!enemy_lightning || target.hp < 320.0) {
+    let safe_brawl =
+        !threat_holds(target, WeaponKind::Laser) || target.dist < 62.0 || target.hp < 360.0 || (!target.charging && obs.t - target.last_beam_t <= 1.5);
+    if have_lightning && obs.me.energy > 30.0 && (!enemy_lightning || target.hp < 320.0) && safe_brawl {
         band.pref = 28.0;
         band.lightning = true;
     } else if own_holds(obs, WeaponKind::Laser) {
         band.pref = genome.laser_range;
         if enemy_lightning && !have_lightning {
-            band.pref = band.pref.max(70.0);
+            band.pref = band.pref.max(72.0);
         }
     } else {
-        let healthy = obs.me.max_hp <= 0.0 || obs.me.hp >= 0.5 * obs.me.max_hp;
-        if threat_holds(target, WeaponKind::Mortar) && healthy {
+        if enemy_lightning {
+            band.pref = band.pref.max(72.0);
+        }
+        // Gun against a laser in the open loses; keep out of its sweet spot.
+        if !ffa_posture && threat_holds(target, WeaponKind::Laser) {
+            band.pref = band.pref.max(95.0);
+        }
+        if !ffa_posture && threat_holds(target, WeaponKind::Mortar) && healthy {
             band.pref = band.pref.min(45.0);
         }
-        if enemy_lightning && !have_lightning {
-            band.pref = band.pref.max(70.0);
+    }
+    // Practice: finish a weak, isolated target up close.
+    let target_weak = target.max_hp > 0.0 && target.hp < 0.35 * target.max_hp;
+    let me_ok = obs.me.max_hp <= 0.0 || obs.me.hp > 0.45 * obs.me.max_hp;
+    if !ffa_posture && target_weak && me_ok && target.dist < 90.0 && others_within(140.0) == 0 {
+        band.pref = 22.0;
+    }
+    // FFA standoff: shift into 95..130 m when enemy holds Laser/Mortar or another threat is within 160 m.
+    if ffa_posture
+        && !(band.lightning && target.hp < 320.0)
+        && (threat_holds(target, WeaponKind::Laser) || threat_holds(target, WeaponKind::Mortar) || others_within(160.0) >= 1)
+    {
+        band.pref = band.pref.clamp(95.0, 130.0);
+        band.lightning = false;
+    }
+    // A crowd nearby: stand off rather than brawl in the middle of it.
+    if others_within(150.0) >= 2 && !(band.lightning && target.hp < 320.0) {
+        band.pref = band.pref.max(115.0);
+        if ffa_posture {
+            band.pref = band.pref.min(130.0);
         }
     }
-    if genome.cdwin_push
-        && threat_holds(target, WeaponKind::Laser)
-        && !target.charging
-        && obs.t - target.last_beam_t <= 1.5
-        && target.dist < 150.0
-    {
+    if genome.cdwin_push && threat_holds(target, WeaponKind::Laser) && !target.charging && obs.t - target.last_beam_t <= 1.5 && target.dist < 150.0 {
         band.pref = band.pref.min(35.0);
         band.cdwin = true;
     }
@@ -321,29 +383,19 @@ fn simulate<E: MoveEnv>(env: &E, kin: &Kin, dir: [f64; 2], boost: bool) -> Traj 
     };
     for k in 0..STEPS {
         let t = k as f64 * DT;
-        let speed = if boost && moving && t < kin.boost_s {
-            kin.boost
-        } else {
-            kin.walk
-        };
+        let speed = if boost && moving && t < kin.boost_s { kin.boost } else { kin.walk };
         let want = [dir[0] * speed, dir[1] * speed];
         let dv = sub(want, v);
         let dv_len = dv[0].hypot(dv[1]);
         let max = kin.accel * DT;
         let f = if dv_len > max { max / dv_len } else { 1.0 };
         let nv = [v[0] + dv[0] * f, v[1] + dv[1] * f];
-        let np = [
-            p[0] + 0.5 * (v[0] + nv[0]) * DT,
-            p[1] + 0.5 * (v[1] + nv[1]) * DT,
-        ];
+        let np = [p[0] + 0.5 * (v[0] + nv[0]) * DT, p[1] + 0.5 * (v[1] + nv[1]) * DT];
         let moved = (np[0] - p[0]).abs() + (np[1] - p[1]).abs() > 1e-9;
         // From an unwalkable spot (inside the wall margin) only the map edge
         // blocks, so the mech can walk back out.
         let from_ok = env.walkable(p[0], p[1]);
-        if moved
-            && (!bounds.contains(np[0], np[1], kin.radius)
-                || (from_ok && !env.walkable(np[0], np[1])))
-        {
+        if moved && (!bounds.contains(np[0], np[1], kin.radius) || (from_ok && !env.walkable(np[0], np[1]))) {
             traj.blocked_at = Some(k);
             for q in &mut traj.pts[k + 1..] {
                 *q = p;
@@ -399,11 +451,7 @@ fn bullet_miss(b: &Bullet, traj: &Traj) -> (f64, f64) {
         let r0 = sub(bp, p0);
         let rv = sub(bv, cv);
         let rv2 = dot(rv, rv);
-        let s = if rv2 > 1e-12 {
-            clamp(-dot(r0, rv) / rv2, 0.0, len)
-        } else {
-            0.0
-        };
+        let s = if rv2 > 1e-12 { clamp(-dot(r0, rv) / rv2, 0.0, len) } else { 0.0 };
         let m = (r0[0] + rv[0] * s).hypot(r0[1] + rv[1] * s);
         if m < best.0 {
             best = (m, t0 + s);
@@ -441,6 +489,8 @@ pub struct MovePlanner {
     leg_end_t: f64,
     /// When `hit_flip` last flipped the strafe.
     last_hit_flip_t: f64,
+    /// When the strafe last flipped for any reason.
+    last_flip_t: f64,
 }
 
 /// Everything the scorer needs, built once per decision.
@@ -474,10 +524,26 @@ struct Ctx<'a> {
     n_arc: usize,
     cubes: Points<MAX_CUBES>,
     avoid_cubes: bool,
+    /// Reachable loose cube within 35 m (no closer to target than us) to drift toward in Fight.
+    fight_cube: Option<[f64; 2]>,
     /// Line-of-sight hints, one per line kind, kept across candidates.
     charger_hints: [u32; MAX_CHARGERS],
     watcher_hints: [u32; MAX_WATCHERS],
     peek_hint: u32,
+    /// Our velocity's unit vector, or zero when nearly still.
+    cur_vel_unit: [f64; 2],
+    /// The strafe has not just flipped, so velocity continuity applies.
+    flip_settled: bool,
+    /// A mortar shell lands near us.
+    mortar_danger: bool,
+    /// A LOS edge to the target is within reach and peeking makes sense.
+    can_peek: bool,
+    /// FFA: nearest threats within [`SEP_RANGE`], at eye height.
+    sep_threats: [[f64; 3]; MAX_SEP],
+    n_sep: usize,
+    sep_hints: [u32; MAX_SEP],
+    /// The final shrink: pinned to the next zone center.
+    final_hold: bool,
 }
 
 impl MovePlanner {
@@ -486,6 +552,7 @@ impl MovePlanner {
             strafe_sign: if rng.chance(0.5) { 1.0 } else { -1.0 },
             leg_end_t: f64::NEG_INFINITY,
             last_hit_flip_t: f64::NEG_INFINITY,
+            last_flip_t: f64::NEG_INFINITY,
         }
     }
 
@@ -502,6 +569,7 @@ impl MovePlanner {
         threats: &[ThreatInfo],
         has_los_to_target: bool,
         laser_ready_or_charging: bool,
+        chasing_laser: bool,
         rng: &mut Rng64,
     ) -> MoveDecision {
         self.plan_core(
@@ -515,6 +583,7 @@ impl MovePlanner {
             threats,
             has_los_to_target,
             laser_ready_or_charging,
+            chasing_laser,
             rng,
         )
     }
@@ -526,12 +595,14 @@ impl MovePlanner {
         if genome.hit_flip && t - last_damage_t <= 0.15 && t - self.last_hit_flip_t >= 0.5 {
             self.strafe_sign = -self.strafe_sign;
             self.last_hit_flip_t = t;
+            self.last_flip_t = t;
             self.leg_end_t = t + rng.range(lo, hi);
             return;
         }
         if t >= self.leg_end_t {
             if self.leg_end_t.is_finite() && rng.chance(p_flip) {
                 self.strafe_sign = -self.strafe_sign;
+                self.last_flip_t = t;
             }
             self.leg_end_t = t + rng.range(lo, hi);
         }
@@ -550,6 +621,7 @@ impl MovePlanner {
         threats: &[ThreatInfo],
         has_los_to_target: bool,
         laser_ready_or_charging: bool,
+        chasing_laser: bool,
         rng: &mut Rng64,
     ) -> MoveDecision {
         let me = &obs.me;
@@ -564,17 +636,42 @@ impl MovePlanner {
         if let Some(tg) = target {
             let to = norm(sub(xy(tg.pos), pos2));
             let side = [-to[1] * self.strafe_sign, to[0] * self.strafe_sign];
-            if side != [0.0, 0.0]
-                && env.step_blocked(me.pos, side)
-                && !env.step_blocked(me.pos, [-side[0], -side[1]])
-            {
+            if side != [0.0, 0.0] && env.step_blocked(me.pos, side) && !env.step_blocked(me.pos, [-side[0], -side[1]]) {
                 self.strafe_sign = -self.strafe_sign;
+                self.last_flip_t = t;
                 let (lo, hi, _) = cadence(genome.strafe_style);
                 self.leg_end_t = t + rng.range(lo, hi);
             }
         }
 
-        let band = target.map(|tg| preferred_range(obs, genome, tg));
+        let ffa = mem.is_ffa();
+        let band = target.map(|tg| preferred_range(obs, ffa, genome, tg, threats));
+        let speed = me.vel[0].hypot(me.vel[1]);
+        let cur_vel_unit = if speed > 1.0 { [me.vel[0] / speed, me.vel[1] / speed] } else { [0.0, 0.0] };
+        let mut peek_hint = NO_HINT;
+        let can_peek = genome.laser_peek
+            && own_holds(obs, WeaponKind::Laser)
+            && target.is_some_and(|tg| {
+                dist_xy(pos2, xy(tg.pos)) > 65.0
+                    && peek_edge_nearby(env, me.pos, st.eye_height, [tg.pos[0], tg.pos[1], tg.pos[2] + 0.5 * st.height], &mut peek_hint)
+            });
+        let final_hold = obs.zone.next_radius > 0.0 && obs.zone.next_radius <= FINAL_RADIUS;
+        let fight_cube = if mode == Mode::Fight && me.cubes < genome.cube_cap {
+            target.and_then(|tg| {
+                obs.cubes
+                    .iter()
+                    .filter(|c| (c.pos[2] - me.pos[2]).abs() <= 3.2 && env.walkable(c.pos[0], c.pos[1]))
+                    .filter_map(|c| {
+                        let d_me = dist_xy(pos2, xy(c.pos));
+                        let d_tg = dist_xy(xy(tg.pos), xy(c.pos));
+                        (d_me <= 35.0 && d_me <= d_tg).then_some((d_me, xy(c.pos)))
+                    })
+                    .min_by(|a, b| a.0.total_cmp(&b.0))
+                    .map(|(_, p)| p)
+            })
+        } else {
+            None
+        };
         let mut ctx = Ctx {
             obs,
             genome,
@@ -591,7 +688,7 @@ impl MovePlanner {
             walk: st.walk_speed.max(0.1),
             boost_speed: st.boost_speed.max(0.1),
             front_half: (st.front_arc_deg.to_radians() * 0.5).clamp(0.1, PI),
-            ffa: mem.is_ffa(),
+            ffa,
             bullets: [Bullet::default(); MAX_BULLETS],
             n_bullets: 0,
             shells: [Shell::default(); MAX_SHELLS],
@@ -605,9 +702,18 @@ impl MovePlanner {
             n_arc: 0,
             cubes: Points::new(),
             avoid_cubes: me.cubes >= genome.cube_cap,
+            fight_cube,
             charger_hints: [NO_HINT; MAX_CHARGERS],
             watcher_hints: [NO_HINT; MAX_WATCHERS],
-            peek_hint: NO_HINT,
+            peek_hint,
+            cur_vel_unit,
+            flip_settled: t - self.last_flip_t > FLIP_SETTLE_S,
+            mortar_danger: false,
+            can_peek,
+            sep_threats: [[0.0; 3]; MAX_SEP],
+            n_sep: 0,
+            sep_hints: [NO_HINT; MAX_SEP],
+            final_hold,
         };
         for w in me.weapons.iter().flatten() {
             if let WeaponObs::Mortar { stats, .. } = w {
@@ -646,10 +752,7 @@ impl MovePlanner {
                 }
                 ProjectileKind::Mortar => {
                     if let Some((at, ti)) = mortar_impact(p.pos, p.vel, me.pos[2]) {
-                        if dist_xy(at, pos2)
-                            < ctx.splash_r + st.radius + MORTAR_MARGIN + st.boost_speed * 1.5
-                            && ctx.n_shells < MAX_SHELLS
-                        {
+                        if dist_xy(at, pos2) < ctx.splash_r + st.radius + MORTAR_MARGIN + st.boost_speed * 1.5 && ctx.n_shells < MAX_SHELLS {
                             ctx.shells[ctx.n_shells] = Shell { at, t: ti };
                             ctx.n_shells += 1;
                         }
@@ -660,13 +763,11 @@ impl MovePlanner {
         let mortar_danger = ctx.shells[..ctx.n_shells]
             .iter()
             .any(|s| dist_xy(s.at, pos2) < ctx.splash_r + st.radius + MORTAR_MARGIN);
+        ctx.mortar_danger = mortar_danger;
 
         // Lasers charging at us.
         for th in threats {
-            if ctx.n_chargers < MAX_CHARGERS
-                && threat_holds(th, WeaponKind::Laser)
-                && laser_aimed_at(th, pos2)
-            {
+            if ctx.n_chargers < MAX_CHARGERS && threat_holds(th, WeaponKind::Laser) && laser_aimed_at(th, pos2) {
                 let a = th.aim[0];
                 ctx.chargers[ctx.n_chargers] = Charger {
                     eye: [th.pos[0], th.pos[1], th.pos[2] + st.eye_height],
@@ -681,11 +782,7 @@ impl MovePlanner {
         let target_id = target.map(|tg| tg.id);
         let mut others: [(f64, usize); 8] = [(f64::INFINITY, usize::MAX); 8];
         for (i, th) in threats.iter().enumerate() {
-            if Some(th.id) == target_id
-                || th.is_ghost
-                || t - th.last_seen_t > 3.0
-                || th.dist > 180.0
-            {
+            if Some(th.id) == target_id || th.is_ghost || t - th.last_seen_t > 3.0 || th.dist > 180.0 {
                 continue;
             }
             // Insertion into the 8 closest.
@@ -709,6 +806,33 @@ impl MovePlanner {
                 ctx.arc_threats[ctx.n_arc] = xy(th.pos);
                 ctx.n_arc += 1;
             }
+            if ffa && d < SEP_RANGE && ctx.n_sep < MAX_SEP {
+                ctx.sep_threats[ctx.n_sep] = [th.pos[0], th.pos[1], th.pos[2] + st.eye_height];
+                ctx.n_sep += 1;
+            }
+        }
+
+        // Home hold: in reach of home, inside safe zone, nothing incoming, and unseen by anyone near.
+        let z = &obs.zone;
+        let in_cur_zone = z.radius <= 0.0 || dist_xy(pos2, z.center) <= z.radius - 3.0;
+        let in_next_zone = z.next_radius <= 0.0 || obs.t < z.shrink_start - 20.0 || dist_xy(pos2, z.next_center) <= z.next_radius - 3.0;
+        if mode == Mode::Home
+            && !final_hold
+            && ctx.n_bullets == 0
+            && !mortar_danger
+            && ctx.n_chargers == 0
+            && in_cur_zone
+            && in_next_zone
+            && goal.is_some_and(|g| dist_xy(pos2, xy(g.pos)) <= g.radius)
+        {
+            let seen = threats.iter().any(|th| !th.is_ghost && th.visible_now && th.los && th.dist < 130.0);
+            if !seen {
+                return MoveDecision {
+                    move_dir: [0.0, 0.0],
+                    boost: false,
+                    jump: false,
+                };
+            }
         }
 
         // Cubes to steer around when full.
@@ -728,19 +852,38 @@ impl MovePlanner {
         // Boost and quiet walk.
         let charging = own_laser_charging(obs);
         let have_lightning = own_holds(obs, WeaponKind::Lightning);
+        let has_laser = own_holds(obs, WeaponKind::Laser);
+        let threat_near = threats.iter().any(|th| th.visible_now && th.los && th.dist < 85.0);
+        let dodging = ctx.n_bullets > 0 || mortar_danger || ctx.n_chargers > 0;
+        let home_evade_los =
+            mode == Mode::Home && ffa && me.energy > 35.0 && threats.iter().any(|th| !th.is_ghost && th.visible_now && th.los && th.dist < 85.0);
+        let chasing_laser_now = mode == Mode::Loot
+            && (chasing_laser
+                || obs
+                    .pickups
+                    .iter()
+                    .any(|p| p.kind == WeaponKind::Laser && goal.is_some_and(|g| dist_xy(xy(p.pos), xy(g.pos)) < 2.0)));
+        let energy_ok_20 = if me.max_energy > 0.0 {
+            me.energy > 0.20 * me.max_energy
+        } else {
+            me.energy > 0.20
+        };
+        let early_uncontested_laser =
+            !has_laser && t < 25.0 && energy_ok_20 && chasing_laser_now && !threats.iter().any(|th| !th.is_ghost && th.visible_now && th.los && th.dist < 60.0);
         let reserve = if have_lightning {
             35.0
         } else if matches!(mode, Mode::ZoneMust | Mode::Retreat) {
             12.0
+        } else if early_uncontested_laser {
+            0.20 * me.max_energy.max(100.0)
         } else {
             22.0
         };
-        let threat_near = threats.iter().any(|th| th.dist < 120.0);
-        let dodging = ctx.n_bullets > 0 || mortar_danger || ctx.n_chargers > 0;
+        let farm_orbit_quiet = mode == Mode::Farm && goal.is_some_and(|g| dist_xy(pos2, xy(g.pos)) <= g.radius);
         let quiet = genome.quiet_walk
             && !dodging
-            && (matches!(mode, Mode::Home | Mode::ZoneShould)
-                || (mode == Mode::Explore && t >= 90.0))
+            && !home_evade_los
+            && (matches!(mode, Mode::Home | Mode::ZoneShould | Mode::Explore) || (mode == Mode::Loot && !early_uncontested_laser) || farm_orbit_quiet)
             && !threat_near
             && t - last_dmg > 3.0;
         let cdwin = band.is_some_and(|b| b.cdwin);
@@ -750,30 +893,20 @@ impl MovePlanner {
             || ctx.n_chargers > 0
             || t - last_dmg <= 1.5
             || cdwin
-            || closing;
+            || closing
+            || home_evade_los
+            || early_uncontested_laser;
         let boost_ok = !charging && !quiet && me.grounded && me.energy > reserve && boost_reason;
 
         let charge_mult = if charging { st.charge_move_mult } else { 1.0 };
-        let quiet_scale = if quiet {
-            (QUIET_SPEED / ctx.walk).min(1.0)
-        } else {
-            1.0
-        };
+        let quiet_scale = if quiet { (QUIET_SPEED / ctx.walk).min(1.0) } else { 1.0 };
         let kin = Kin {
             pos: me.pos,
             vel: [me.vel[0], me.vel[1]],
             walk: st.walk_speed * charge_mult * quiet_scale,
             boost: st.boost_speed * charge_mult,
-            accel: if me.grounded {
-                st.ground_accel
-            } else {
-                st.air_accel
-            },
-            boost_s: if st.boost_drain > 0.0 {
-                me.energy / st.boost_drain
-            } else {
-                f64::INFINITY
-            },
+            accel: if me.grounded { st.ground_accel } else { st.air_accel },
+            boost_s: if st.boost_drain > 0.0 { me.energy / st.boost_drain } else { f64::INFINITY },
             radius: st.radius,
         };
 
@@ -807,7 +940,7 @@ impl MovePlanner {
         let Some((_, mut pick)) = best else {
             return MoveDecision::default();
         };
-        if mode == Mode::Fight && pick.dir == [0.0, 0.0] {
+        if matches!(mode, Mode::Fight | Mode::Farm) && pick.dir == [0.0, 0.0] {
             if let Some((_, m)) = best_moving {
                 pick = m;
             }
@@ -844,8 +977,7 @@ impl MovePlanner {
                 let z = b.p[2] + b.v[2] * tm;
                 if z >= ctx.feet - 1.0 && z <= ctx.feet + ctx.height + 1.0 {
                     let urgency = 1.0 - 0.5 * (tm / BULLET_HORIZON);
-                    cost += g.dodge_weight * 8.0 * (1.0 - miss / hit_r) * urgency
-                        + g.dodge_weight * 2.0;
+                    cost += g.dodge_weight * 8.0 * (1.0 - miss / hit_r) * urgency + g.dodge_weight * 2.0;
                 }
             }
         }
@@ -896,17 +1028,13 @@ impl MovePlanner {
                 let d0 = dist_xy(start, tp);
                 let err = d0 - band.pref;
                 let mut radial = clamp(err / 15.0, -1.0, 1.0);
-                let peek_hold = g.laser_peek && !ctx.laser_ready_or_charging;
+                let peek_hold = ctx.can_peek && !ctx.laser_ready_or_charging;
                 let hunting = !ctx.has_los_to_target && !peek_hold;
                 // No sight line: follow the A* waypoint around the cover rather than into it.
-                let detour = ctx
-                    .goal
-                    .filter(|_| hunting)
-                    .map(|nav| xy(nav.pos))
-                    .and_then(|wp| {
-                        let to_wp = norm(sub(wp, start));
-                        (to_wp != [0.0, 0.0] && dist_xy(start, wp) > 1.5).then_some(to_wp)
-                    });
+                let detour = ctx.goal.filter(|_| hunting).map(|nav| xy(nav.pos)).and_then(|wp| {
+                    let to_wp = norm(sub(wp, start));
+                    (to_wp != [0.0, 0.0] && dist_xy(start, wp) > 1.5).then_some(to_wp)
+                });
                 if let Some(to_wp) = detour {
                     cost -= 28.0 * dot(avg_v, to_wp) / ctx.walk;
                     if traj.blocked_at.is_none() {
@@ -920,20 +1048,30 @@ impl MovePlanner {
                         tangent[0] * (1.0 - 0.7 * radial.abs()) + to[0] * radial,
                         tangent[1] * (1.0 - 0.7 * radial.abs()) + to[1] * radial,
                     ]);
-                    let w = if band.cdwin || (band.lightning && err > 0.0) {
-                        32.0
-                    } else {
-                        25.0
-                    };
+                    let w = if band.cdwin || (band.lightning && err > 0.0) { 32.0 } else { 25.0 };
                     cost -= w * dot(avg_v, desired) / ctx.walk;
                     cost += 0.5 * (dist_xy(end, tp) - band.pref).abs();
                 }
                 if moved < 1.5 {
                     cost += 40.0;
                 }
+                // Slight bias toward a reachable loose cube within 35 m that is no closer to the target.
+                if let Some(cube_xy) = ctx.fight_cube {
+                    let d0_c = dist_xy(start, cube_xy);
+                    let de_c = dist_xy(end, cube_xy);
+                    if d0_c > de_c {
+                        cost -= (1.2 * (d0_c - de_c)).min(10.0);
+                    }
+                }
+                // Commit to the current leg instead of wobbling between
+                // neighboring headings, unless dodging or just flipped.
+                if ctx.flip_settled && ctx.n_bullets == 0 && ctx.n_chargers == 0 && !ctx.mortar_danger && traj.dir != [0.0, 0.0] {
+                    cost -= 4.0 * dot(traj.dir, ctx.cur_vel_unit);
+                }
             }
             (mode, _, _) => {
-                if let Some(goal) = ctx.goal {
+                // The final shrink overrides wandering toward any other goal.
+                if let Some(goal) = ctx.goal.filter(|_| !ctx.final_hold) {
                     let gp = xy(goal.pos);
                     let d0 = dist_xy(start, gp);
                     let de = dist_xy(end, gp);
@@ -941,6 +1079,14 @@ impl MovePlanner {
                         cost += 2.0 * de;
                     } else if d0 > goal.radius {
                         cost -= 3.0 * (d0 - de.max(goal.radius));
+                    } else if mode == Mode::Farm {
+                        let to = norm(sub(gp, start));
+                        let tangent = [-to[1] * self.strafe_sign, to[0] * self.strafe_sign];
+                        cost -= 12.0 * dot(avg_v, tangent) / ctx.walk;
+                        cost += 0.5 * (de - goal.radius).abs();
+                        if moved < 1.5 {
+                            cost += 40.0;
+                        }
                     }
                 } else if mode == Mode::Fight && moved < 1.5 {
                     cost += 40.0;
@@ -948,22 +1094,30 @@ impl MovePlanner {
                 if matches!(mode, Mode::Retreat | Mode::Home) && g.exposure_weight > 0.0 {
                     cost += g.exposure_weight * 0.15 * env.exposure(end[0], end[1]);
                 }
+                // FFA: keep apart from nearby threats and out of their sight.
+                if ctx.ffa && matches!(mode, Mode::Home | Mode::ZoneShould | Mode::Explore) {
+                    for i in 0..ctx.n_sep {
+                        let th = ctx.sep_threats[i];
+                        cost += 0.8 * (140.0 - dist_xy(end, xy(th))).max(0.0);
+                        if !env.los(th, end_body, &mut ctx.sep_hints[i]) {
+                            cost -= 25.0;
+                        }
+                    }
+                }
             }
         }
 
-        // (e) Laser peek at the LOS boundary.
-        if let (Mode::Fight, Some(tg), true) = (ctx.mode, ctx.target, g.laser_peek) {
-            if own_holds(obs, WeaponKind::Laser) {
-                let eye = [end[0], end[1], ctx.feet + ctx.eye];
-                let body = [tg.pos[0], tg.pos[1], tg.pos[2] + 0.5 * ctx.height];
-                let los = env.los(eye, body, &mut ctx.peek_hint);
-                if ctx.laser_ready_or_charging && ctx.n_chargers == 0 {
-                    cost += if los { -20.0 } else { 20.0 };
-                } else if los {
-                    cost += 20.0;
-                } else {
-                    cost -= 10.0;
-                }
+        // (e) Laser peek at the LOS boundary, only where an edge is in reach.
+        if let (Mode::Fight, Some(tg), true) = (ctx.mode, ctx.target, ctx.can_peek) {
+            let eye = [end[0], end[1], ctx.feet + ctx.eye];
+            let body = [tg.pos[0], tg.pos[1], tg.pos[2] + 0.5 * ctx.height];
+            let los = env.los(eye, body, &mut ctx.peek_hint);
+            if ctx.laser_ready_or_charging && ctx.n_chargers == 0 {
+                cost += if los { -20.0 } else { 20.0 };
+            } else if los {
+                cost += 20.0;
+            } else {
+                cost -= 10.0;
             }
         }
 
@@ -995,10 +1149,7 @@ impl MovePlanner {
         if ctx.avoid_cubes {
             let keep = PICKUP_RADIUS + CUBE_MARGIN;
             for &c in ctx.cubes.as_slice() {
-                let d = traj.pts[1..]
-                    .iter()
-                    .map(|&p| dist_xy(p, c))
-                    .fold(f64::INFINITY, f64::min);
+                let d = traj.pts[1..].iter().map(|&p| dist_xy(p, c)).fold(f64::INFINITY, f64::min);
                 if d < keep {
                     cost += 50.0 + 10.0 * (keep - d);
                 }
@@ -1006,7 +1157,8 @@ impl MovePlanner {
         }
 
         // (h) Walls and the zone.
-        if traj.min_clear < LOW_CLEARANCE {
+        let settling_home = ctx.mode == Mode::Home && ctx.goal.is_some_and(|goal| dist_xy(end, xy(goal.pos)) <= goal.radius + 2.0);
+        if traj.min_clear < LOW_CLEARANCE && !settling_home {
             cost += 6.0 * (LOW_CLEARANCE - traj.min_clear.max(0.0));
         }
         let z = &obs.zone;
@@ -1022,6 +1174,11 @@ impl MovePlanner {
                 let w = if ctx.mode == Mode::Fight { 0.5 } else { 1.0 };
                 cost += w * (5.0 + 2.0 * ex);
             }
+        }
+        // The final shrink leaves no room: hold its exact center.
+        if ctx.final_hold {
+            let w = if ctx.mode == Mode::Fight { 1.5 } else { 4.0 };
+            cost += w * dist_xy(end, z.next_center);
         }
         cost
     }
@@ -1054,12 +1211,7 @@ mod tests {
         fn seg_hits(r: &[f64; 4], a: [f64; 3], b: [f64; 3]) -> bool {
             let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
             let (mut t0, mut t1) = (0.0f64, 1.0f64);
-            for (p, q) in [
-                (-dx, a[0] - r[0]),
-                (dx, r[2] - a[0]),
-                (-dy, a[1] - r[1]),
-                (dy, r[3] - a[1]),
-            ] {
+            for (p, q) in [(-dx, a[0] - r[0]), (dx, r[2] - a[0]), (-dy, a[1] - r[1]), (dy, r[3] - a[1])] {
                 if p.abs() < 1e-12 {
                     if q < 0.0 {
                         return false;
@@ -1082,10 +1234,7 @@ mod tests {
             self.walls.iter().all(|r| Self::rect_dist(r, x, y) > 2.5)
         }
         fn clearance(&self, x: f64, y: f64) -> f64 {
-            self.walls
-                .iter()
-                .map(|r| Self::rect_dist(r, x, y))
-                .fold(50.0, f64::min)
+            self.walls.iter().map(|r| Self::rect_dist(r, x, y)).fold(50.0, f64::min)
         }
         fn exposure(&self, _: f64, _: f64) -> f64 {
             0.0
@@ -1110,6 +1259,7 @@ mod tests {
     struct Mem {
         last_dmg: f64,
         cubes: Vec<[f64; 2]>,
+        ffa: bool,
     }
 
     impl Recall for Mem {
@@ -1117,7 +1267,7 @@ mod tests {
             self.last_dmg
         }
         fn is_ffa(&self) -> bool {
-            false
+            self.ffa
         }
         fn cubes(&self, out: &mut Points<MAX_CUBES>) {
             for &c in &self.cubes {
@@ -1130,6 +1280,7 @@ mod tests {
         Mem {
             last_dmg: f64::NEG_INFINITY,
             cubes: Vec::new(),
+            ffa: false,
         }
     }
 
@@ -1208,9 +1359,7 @@ mod tests {
         threats: &[ThreatInfo],
     ) -> MoveDecision {
         let mut rng = Rng64::new(7, 0);
-        p.plan_core(
-            o, env, m, g, mode, goal, target, threats, true, true, &mut rng,
-        )
+        p.plan_core(o, env, m, g, mode, goal, target, threats, true, true, false, &mut rng)
     }
 
     fn kin(o: &Obs) -> Kin {
@@ -1284,10 +1433,7 @@ mod tests {
         assert_eq!(p.strafe_sign, -s0);
         p.update_strafe(11.0, &g, 10.95, &mut rng);
         assert_eq!(p.strafe_sign, s0);
-        let off = ApexGenome {
-            hit_flip: false,
-            ..g
-        };
+        let off = ApexGenome { hit_flip: false, ..g };
         p.update_strafe(12.0, &off, 11.95, &mut rng);
         assert_eq!(p.strafe_sign, s0);
     }
@@ -1303,52 +1449,43 @@ mod tests {
         let mut o = obs();
         give(&mut o, 0, WeaponKind::Gun);
         let plain = threat(1, [100.0, 0.0, 0.0], [Some(WeaponKind::Gun), None]);
-        assert_eq!(preferred_range(&o, &g, &plain).pref, 90.0);
+        assert_eq!(preferred_range(&o, false, &g, &plain, &[]).pref, 90.0);
         let lightning = threat(1, [100.0, 0.0, 0.0], [Some(WeaponKind::Lightning), None]);
-        let g_close = ApexGenome {
-            gun_range: 50.0,
-            ..g
-        };
-        assert_eq!(preferred_range(&o, &g_close, &lightning).pref, 70.0);
+        let g_close = ApexGenome { gun_range: 50.0, ..g };
+        assert_eq!(preferred_range(&o, false, &g_close, &lightning, &[]).pref, 72.0);
         let mortar = threat(1, [100.0, 0.0, 0.0], [Some(WeaponKind::Mortar), None]);
-        assert_eq!(preferred_range(&o, &g, &mortar).pref, 45.0);
+        assert_eq!(preferred_range(&o, false, &g, &mortar, &[]).pref, 45.0);
         o.me.hp = 300.0;
-        assert_eq!(preferred_range(&o, &g, &mortar).pref, 90.0);
+        assert_eq!(preferred_range(&o, false, &g, &mortar, &[]).pref, 90.0);
         o.me.hp = 1400.0;
 
         give(&mut o, 1, WeaponKind::Laser);
-        assert_eq!(preferred_range(&o, &g, &plain).pref, 120.0);
-        let g_short = ApexGenome {
-            laser_range: 60.0,
-            ..g
-        };
-        assert_eq!(preferred_range(&o, &g_short, &lightning).pref, 70.0);
+        assert_eq!(preferred_range(&o, false, &g, &plain, &[]).pref, 120.0);
+        let g_short = ApexGenome { laser_range: 60.0, ..g };
+        assert_eq!(preferred_range(&o, false, &g_short, &lightning, &[]).pref, 72.0);
 
         give(&mut o, 1, WeaponKind::Lightning);
-        let b = preferred_range(&o, &g, &plain);
+        let b = preferred_range(&o, false, &g, &plain, &[]);
         assert!(b.lightning && b.pref == 28.0);
-        assert!(!preferred_range(&o, &g, &lightning).lightning);
-        let weak = ThreatInfo {
-            hp: 300.0,
-            ..lightning
-        };
-        assert_eq!(preferred_range(&o, &g, &weak).pref, 28.0);
+        assert!(!preferred_range(&o, false, &g, &lightning, &[]).lightning);
+        let weak = ThreatInfo { hp: 300.0, ..lightning };
+        assert_eq!(preferred_range(&o, false, &g, &weak, &[]).pref, 28.0);
         o.me.energy = 20.0;
-        assert_eq!(preferred_range(&o, &g, &plain).pref, 90.0);
+        assert_eq!(preferred_range(&o, false, &g, &plain, &[]).pref, 90.0);
 
         // Cooldown window on a laser that just fired.
         let mut laser = threat(1, [100.0, 0.0, 0.0], [Some(WeaponKind::Laser), None]);
         laser.last_beam_t = o.t - 1.0;
-        let b = preferred_range(&o, &g, &laser);
+        let b = preferred_range(&o, false, &g, &laser, &[]);
         assert!(b.cdwin && b.pref == 35.0);
         laser.charging = true;
-        assert!(!preferred_range(&o, &g, &laser).cdwin);
+        assert!(!preferred_range(&o, false, &g, &laser, &[]).cdwin);
         laser.charging = false;
         laser.last_beam_t = o.t - 2.0;
-        assert!(!preferred_range(&o, &g, &laser).cdwin);
+        assert!(!preferred_range(&o, false, &g, &laser, &[]).cdwin);
         laser.last_beam_t = o.t - 1.0;
         laser.dist = 160.0;
-        assert!(!preferred_range(&o, &g, &laser).cdwin);
+        assert!(!preferred_range(&o, false, &g, &laser, &[]).cdwin);
     }
 
     #[test]
@@ -1363,10 +1500,7 @@ mod tests {
         assert!((t.end_vel[0] - 11.7).abs() < 1e-9);
         let b = simulate(&env, &k, [1.0, 0.0], true);
         assert!((b.end_vel[0] - 19.5).abs() < 1e-9);
-        let slow = Kin {
-            walk: 11.7 * 0.5,
-            ..k
-        };
+        let slow = Kin { walk: 11.7 * 0.5, ..k };
         let s = simulate(&env, &slow, [1.0, 0.0], false);
         assert!((s.end_vel[0] - 5.85).abs() < 1e-9);
         // A wall stops it.
@@ -1411,17 +1545,7 @@ mod tests {
         };
         let mut rng = Rng64::new(1, 0);
         let mut p = MovePlanner::new(&mut rng);
-        let d = run(
-            &mut p,
-            &o,
-            &Mock::open(),
-            &mem(),
-            &g,
-            Mode::Home,
-            None,
-            None,
-            &[],
-        );
+        let d = run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::Home, None, None, &[]);
         assert!(d.move_dir[1].abs() > 0.5, "{:?}", d.move_dir);
     }
 
@@ -1441,17 +1565,7 @@ mod tests {
         let g = ApexGenome::default();
         let mut rng = Rng64::new(1, 0);
         let mut p = MovePlanner::new(&mut rng);
-        let d = run(
-            &mut p,
-            &o,
-            &Mock::open(),
-            &mem(),
-            &g,
-            Mode::Home,
-            None,
-            None,
-            &[],
-        );
+        let d = run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::Home, None, None, &[]);
         assert!(d.boost, "boost to dodge a shell");
         assert!(d.move_dir[0].hypot(d.move_dir[1]) > 0.99);
     }
@@ -1467,41 +1581,16 @@ mod tests {
         let tg = threat(1, [100.0, 0.0, 0.0], [Some(WeaponKind::Gun), None]);
         let mut rng = Rng64::new(1, 0);
         let mut p = MovePlanner::new(&mut rng);
-        let d = run(
-            &mut p,
-            &o,
-            &Mock::open(),
-            &mem(),
-            &g,
-            Mode::Fight,
-            None,
-            Some(&tg),
-            &[tg],
-        );
+        let d = run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::Fight, None, Some(&tg), &[tg]);
         assert!(d.move_dir[0].hypot(d.move_dir[1]) > 0.99);
         // At range, mostly strafing across the line to the target.
         assert!(d.move_dir[1].abs() > 0.6, "{:?}", d.move_dir);
         // Boxed in on all sides: still moves.
         let boxed = Mock {
             half: 200.0,
-            walls: vec![
-                [-6.0, 3.0, 6.0, 6.0],
-                [-6.0, -6.0, 6.0, -3.0],
-                [3.0, -6.0, 6.0, 6.0],
-                [-6.0, -6.0, -3.0, 6.0],
-            ],
+            walls: vec![[-6.0, 3.0, 6.0, 6.0], [-6.0, -6.0, 6.0, -3.0], [3.0, -6.0, 6.0, 6.0], [-6.0, -6.0, -3.0, 6.0]],
         };
-        let d = run(
-            &mut p,
-            &o,
-            &boxed,
-            &mem(),
-            &g,
-            Mode::Fight,
-            None,
-            Some(&tg),
-            &[tg],
-        );
+        let d = run(&mut p, &o, &boxed, &mem(), &g, Mode::Fight, None, Some(&tg), &[tg]);
         assert!(d.move_dir != [0.0, 0.0]);
     }
 
@@ -1516,17 +1605,7 @@ mod tests {
         let tg = threat(1, [150.0, 0.0, 0.0], [Some(WeaponKind::Gun), None]);
         let mut rng = Rng64::new(1, 0);
         let mut p = MovePlanner::new(&mut rng);
-        let d = run(
-            &mut p,
-            &o,
-            &Mock::open(),
-            &mem(),
-            &g,
-            Mode::Fight,
-            None,
-            Some(&tg),
-            &[tg],
-        );
+        let d = run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::Fight, None, Some(&tg), &[tg]);
         assert!(d.move_dir[0] > 0.5, "{:?}", d.move_dir);
     }
 
@@ -1553,38 +1632,14 @@ mod tests {
         };
         let mut rng = Rng64::new(1, 0);
         let mut p = MovePlanner::new(&mut rng);
-        let d = p.plan_core(
-            &o,
-            &env,
-            &mem(),
-            &g,
-            Mode::Fight,
-            Some(wp),
-            Some(&tg),
-            &[tg],
-            false,
-            true,
-            &mut rng,
-        );
+        let d = p.plan_core(&o, &env, &mem(), &g, Mode::Fight, Some(wp), Some(&tg), &[tg], false, true, false, &mut rng);
         let dir = norm(d.move_dir);
         let to_wp = norm([17.0, 32.0]);
         assert!(dot(dir, to_wp) > 0.8, "{:?}", d.move_dir);
         // Without the waypoint it would head at the wall instead.
         let mut rng = Rng64::new(1, 0);
         let mut p = MovePlanner::new(&mut rng);
-        let d = p.plan_core(
-            &o,
-            &env,
-            &mem(),
-            &g,
-            Mode::Fight,
-            None,
-            Some(&tg),
-            &[tg],
-            false,
-            true,
-            &mut rng,
-        );
+        let d = p.plan_core(&o, &env, &mem(), &g, Mode::Fight, None, Some(&tg), &[tg], false, true, false, &mut rng);
         assert!(dot(norm(d.move_dir), to_wp) < 0.8, "{:?}", d.move_dir);
     }
 
@@ -1604,45 +1659,18 @@ mod tests {
         let m = Mem {
             last_dmg: f64::NEG_INFINITY,
             cubes: vec![[6.0, 0.0]],
+            ffa: false,
         };
         let mut rng = Rng64::new(1, 0);
         let mut p = MovePlanner::new(&mut rng);
-        let d = run(
-            &mut p,
-            &o,
-            &Mock::open(),
-            &m,
-            &g,
-            Mode::Explore,
-            Some(goal),
-            None,
-            &[],
-        );
+        let d = run(&mut p, &o, &Mock::open(), &m, &g, Mode::Explore, Some(goal), None, &[]);
         let traj = simulate(&Mock::open(), &kin(&o), norm(d.move_dir), false);
-        let closest = traj
-            .pts
-            .iter()
-            .map(|&q| dist_xy(q, [6.0, 0.0]))
-            .fold(f64::INFINITY, f64::min);
-        assert!(
-            closest >= PICKUP_RADIUS + CUBE_MARGIN,
-            "{closest} {:?}",
-            d.move_dir
-        );
+        let closest = traj.pts.iter().map(|&q| dist_xy(q, [6.0, 0.0])).fold(f64::INFINITY, f64::min);
+        assert!(closest >= PICKUP_RADIUS + CUBE_MARGIN, "{closest} {:?}", d.move_dir);
         assert!(d.move_dir[0] > 0.0);
         // Under the cap it walks straight through.
         o.me.cubes = 0;
-        let d = run(
-            &mut p,
-            &o,
-            &Mock::open(),
-            &m,
-            &g,
-            Mode::Explore,
-            Some(goal),
-            None,
-            &[],
-        );
+        let d = run(&mut p, &o, &Mock::open(), &m, &g, Mode::Explore, Some(goal), None, &[]);
         assert!(d.move_dir[0] > 0.99, "{:?}", d.move_dir);
     }
 
@@ -1669,26 +1697,12 @@ mod tests {
         let th = charger_at_us();
         let mut rng = Rng64::new(1, 0);
         let mut p = MovePlanner::new(&mut rng);
-        let d = run(
-            &mut p,
-            &o,
-            &env,
-            &mem(),
-            &g,
-            Mode::Fight,
-            None,
-            Some(&th),
-            &[th],
-        );
+        let d = run(&mut p, &o, &env, &mem(), &g, Mode::Fight, None, Some(&th), &[th]);
         let mut k = kin(&o);
         k.boost_s = 10.0;
         let traj = simulate(&env, &k, norm(d.move_dir), d.boost);
         let e = traj.end();
-        assert!(
-            !env.los([60.0, 0.0, 8.0], [e[0], e[1], 4.5], &mut NO_HINT.clone()),
-            "{:?} -> {e:?}",
-            d.move_dir
-        );
+        assert!(!env.los([60.0, 0.0, 8.0], [e[0], e[1], 4.5], &mut NO_HINT.clone()), "{:?} -> {e:?}", d.move_dir);
     }
 
     #[test]
@@ -1702,17 +1716,7 @@ mod tests {
         let th = charger_at_us();
         let mut rng = Rng64::new(1, 0);
         let mut p = MovePlanner::new(&mut rng);
-        let d = run(
-            &mut p,
-            &o,
-            &Mock::open(),
-            &mem(),
-            &g,
-            Mode::Fight,
-            None,
-            Some(&th),
-            &[th],
-        );
+        let d = run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::Fight, None, Some(&th), &[th]);
         assert!(d.boost);
         assert!(d.move_dir[1].abs() > 0.9, "{:?}", d.move_dir);
         // No boost while our own laser charges.
@@ -1721,17 +1725,7 @@ mod tests {
             charge: 0.3,
             stats: LaserStats::default(),
         });
-        let d = run(
-            &mut p,
-            &o,
-            &Mock::open(),
-            &mem(),
-            &g,
-            Mode::Fight,
-            None,
-            Some(&th),
-            &[th],
-        );
+        let d = run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::Fight, None, Some(&th), &[th]);
         assert!(!d.boost);
     }
 
@@ -1748,70 +1742,18 @@ mod tests {
         let mut o = obs();
         // ZoneMust boosts when energy is above the 12 reserve.
         o.me.energy = 15.0;
-        assert!(
-            run(
-                &mut p,
-                &o,
-                &Mock::open(),
-                &mem(),
-                &g,
-                Mode::ZoneMust,
-                Some(goal),
-                None,
-                &[]
-            )
-            .boost
-        );
+        assert!(run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::ZoneMust, Some(goal), None, &[]).boost);
         // Loot without a reason does not.
         o.me.energy = 100.0;
-        assert!(
-            !run(
-                &mut p,
-                &o,
-                &Mock::open(),
-                &mem(),
-                &g,
-                Mode::Loot,
-                Some(goal),
-                None,
-                &[]
-            )
-            .boost
-        );
+        assert!(!run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::Loot, Some(goal), None, &[]).boost);
         // Airborne never boosts (that would be the jet).
         o.me.grounded = false;
-        assert!(
-            !run(
-                &mut p,
-                &o,
-                &Mock::open(),
-                &mem(),
-                &g,
-                Mode::ZoneMust,
-                Some(goal),
-                None,
-                &[]
-            )
-            .boost
-        );
+        assert!(!run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::ZoneMust, Some(goal), None, &[]).boost);
         o.me.grounded = true;
         // With lightning the reserve is 35.
         give(&mut o, 0, WeaponKind::Lightning);
         o.me.energy = 30.0;
-        assert!(
-            !run(
-                &mut p,
-                &o,
-                &Mock::open(),
-                &mem(),
-                &g,
-                Mode::ZoneMust,
-                Some(goal),
-                None,
-                &[]
-            )
-            .boost
-        );
+        assert!(!run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::ZoneMust, Some(goal), None, &[]).boost);
     }
 
     #[test]
@@ -1828,82 +1770,29 @@ mod tests {
         };
         let mut rng = Rng64::new(1, 0);
         let mut p = MovePlanner::new(&mut rng);
-        let d = run(
-            &mut p,
-            &o,
-            &Mock::open(),
-            &mem(),
-            &g,
-            Mode::Explore,
-            Some(goal),
-            None,
-            &[],
-        );
+        let d = run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::Explore, Some(goal), None, &[]);
         let mag = d.move_dir[0].hypot(d.move_dir[1]);
         assert!((mag - 4.6 / 11.7).abs() < 1e-9, "{mag}");
         // Not with a threat near, nor in other modes.
         let near = threat(1, [60.0, 60.0, 0.0], [None, None]);
-        let d = run(
-            &mut p,
-            &o,
-            &Mock::open(),
-            &mem(),
-            &g,
-            Mode::Explore,
-            Some(goal),
-            None,
-            &[near],
-        );
+        let d = run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::Explore, Some(goal), None, &[near]);
         assert!((d.move_dir[0].hypot(d.move_dir[1]) - 1.0).abs() < 1e-9);
-        let d = run(
-            &mut p,
-            &o,
-            &Mock::open(),
-            &mem(),
-            &g,
-            Mode::Farm,
-            Some(goal),
-            None,
-            &[],
-        );
+        let d = run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::Farm, Some(goal), None, &[]);
         assert!((d.move_dir[0].hypot(d.move_dir[1]) - 1.0).abs() < 1e-9);
         // Home and ZoneShould stay quiet.
         for mode in [Mode::Home, Mode::ZoneShould] {
-            let d = run(
-                &mut p,
-                &o,
-                &Mock::open(),
-                &mem(),
-                &g,
-                mode,
-                Some(goal),
-                None,
-                &[],
-            );
-            assert!(
-                (d.move_dir[0].hypot(d.move_dir[1]) - 4.6 / 11.7).abs() < 1e-9,
-                "{mode:?}"
-            );
+            let d = run(&mut p, &o, &Mock::open(), &mem(), &g, mode, Some(goal), None, &[]);
+            assert!((d.move_dir[0].hypot(d.move_dir[1]) - 4.6 / 11.7).abs() < 1e-9, "{mode:?}");
         }
-        // Early Explore (before 90 s) runs at full speed.
+        // Early Explore (before 90 s) also walks quietly.
         let mut early = o.clone();
         early.t = 60.0;
-        let d = run(
-            &mut p,
-            &early,
-            &Mock::open(),
-            &mem(),
-            &g,
-            Mode::Explore,
-            Some(goal),
-            None,
-            &[],
-        );
-        assert!(d.move_dir[0].hypot(d.move_dir[1]) > 0.9, "{:?}", d.move_dir);
+        let d = run(&mut p, &early, &Mock::open(), &mem(), &g, Mode::Explore, Some(goal), None, &[]);
+        assert!((d.move_dir[0].hypot(d.move_dir[1]) - 4.6 / 11.7).abs() < 1e-9, "{:?}", d.move_dir);
     }
 
     #[test]
-    fn quiet_walk_never_throttles_loot() {
+    fn quiet_walk_never_throttles_early_unarmed_laser_loot() {
         let goal = NavGoal {
             pos: [100.0, 0.0, 0.0],
             radius: 2.0,
@@ -1915,26 +1804,68 @@ mod tests {
         };
         let mut rng = Rng64::new(1, 0);
         let mut p = MovePlanner::new(&mut rng);
-        for t in [30.0, 150.0] {
+        // Without a laser, chasing a Laser at t < 25.0 with energy > 20% and no close LOS threat runs fast / boosts.
+        let mut early_laser = obs();
+        early_laser.t = 5.0;
+        early_laser.pickups.push(proto::PickupObs {
+            id: 10,
+            kind: WeaponKind::Laser,
+            pos: [100.0, 0.0, 0.0],
+        });
+        let d_fast = run(&mut p, &early_laser, &Mock::open(), &mem(), &g, Mode::Loot, Some(goal), None, &[]);
+        assert!(d_fast.move_dir[0].hypot(d_fast.move_dir[1]) > 0.9, "unarmed early laser {:?}", d_fast.move_dir);
+        assert!(d_fast.boost, "early uncontested laser allows boost");
+        let mut t20_laser = early_laser.clone();
+        t20_laser.t = 20.0;
+        let d_t20 = run(&mut p, &t20_laser, &Mock::open(), &mem(), &g, Mode::Loot, Some(goal), None, &[]);
+        assert!(d_t20.move_dir[0].hypot(d_t20.move_dir[1]) > 0.9, "t=20s early laser {:?}", d_t20.move_dir);
+        assert!(d_t20.boost);
+        // Contested within 60 m or past t = 25.0 stays quiet without boost.
+        let close_seer = threat(1, [50.0, 0.0, 0.0], [None, None]);
+        let d_contested = run(&mut p, &early_laser, &Mock::open(), &mem(), &g, Mode::Loot, Some(goal), None, &[close_seer]);
+        assert!(!d_contested.boost, "contested <60m does not boost");
+        // Otherwise Mode::Loot uses quiet walk (cube, late laser, or armed).
+        for t in [5.0, 30.0] {
             let mut o = obs();
             o.t = t;
-            let d = run(
-                &mut p,
-                &o,
-                &Mock::open(),
-                &mem(),
-                &g,
-                Mode::Loot,
-                Some(goal),
-                None,
-                &[],
-            );
-            assert!(
-                d.move_dir[0].hypot(d.move_dir[1]) > 0.9,
-                "t={t} {:?}",
-                d.move_dir
-            );
+            let d = run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::Loot, Some(goal), None, &[]);
+            assert!((d.move_dir[0].hypot(d.move_dir[1]) - 4.6 / 11.7).abs() < 1e-9, "cube t={t} {:?}", d.move_dir);
         }
+        let mut late_laser = early_laser;
+        late_laser.t = 26.0;
+        let d_late = run(&mut p, &late_laser, &Mock::open(), &mem(), &g, Mode::Loot, Some(goal), None, &[]);
+        assert!(
+            (d_late.move_dir[0].hypot(d_late.move_dir[1]) - 4.6 / 11.7).abs() < 1e-9,
+            "late laser {:?}",
+            d_late.move_dir
+        );
+    }
+
+    #[test]
+    fn farm_orbits_inside_standoff_never_stands_still() {
+        let o = obs();
+        let goal = NavGoal {
+            pos: [20.0, 0.0, 0.0],
+            radius: 26.0,
+            exact: false,
+        };
+        let mut rng = Rng64::new(1, 0);
+        let mut p = MovePlanner::new(&mut rng);
+        let g_quiet = ApexGenome {
+            quiet_walk: true,
+            ..ApexGenome::default()
+        };
+        let d_q = run(&mut p, &o, &Mock::open(), &mem(), &g_quiet, Mode::Farm, Some(goal), None, &[]);
+        let mag_q = d_q.move_dir[0].hypot(d_q.move_dir[1]);
+        assert!((mag_q - 4.6 / 11.7).abs() < 1e-9 && d_q.move_dir[1].abs() > 0.1, "{:?}", d_q.move_dir);
+
+        let g_loud = ApexGenome {
+            quiet_walk: false,
+            ..ApexGenome::default()
+        };
+        let d_l = run(&mut p, &o, &Mock::open(), &mem(), &g_loud, Mode::Farm, Some(goal), None, &[]);
+        let mag_l = d_l.move_dir[0].hypot(d_l.move_dir[1]);
+        assert!(mag_l > 0.9 && d_l.move_dir[1].abs() > 0.5, "{:?}", d_l.move_dir);
     }
 
     #[test]
@@ -1943,34 +1874,14 @@ mod tests {
         let g = ApexGenome::default();
         let mut rng = Rng64::new(1, 0);
         let mut p = MovePlanner::new(&mut rng);
-        let d = run(
-            &mut p,
-            &o,
-            &Mock::open(),
-            &mem(),
-            &g,
-            Mode::Home,
-            None,
-            None,
-            &[],
-        );
+        let d = run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::Home, None, None, &[]);
         assert_eq!(d.move_dir, [0.0, 0.0]);
         let goal = NavGoal {
             pos: [1.0, 0.0, 0.0],
             radius: 3.0,
             exact: false,
         };
-        let d = run(
-            &mut p,
-            &o,
-            &Mock::open(),
-            &mem(),
-            &g,
-            Mode::Loot,
-            Some(goal),
-            None,
-            &[],
-        );
+        let d = run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::Loot, Some(goal), None, &[]);
         assert_eq!(d.move_dir, [0.0, 0.0]);
     }
 
@@ -1994,17 +1905,7 @@ mod tests {
         };
         let mut rng = Rng64::new(1, 0);
         let mut p = MovePlanner::new(&mut rng);
-        let d = run(
-            &mut p,
-            &o,
-            &env,
-            &mem(),
-            &g,
-            Mode::ZoneMust,
-            Some(goal),
-            None,
-            &[],
-        );
+        let d = run(&mut p, &o, &env, &mem(), &g, Mode::ZoneMust, Some(goal), None, &[]);
         assert!(d.move_dir[0] < -0.9, "{:?}", d.move_dir);
     }
 
@@ -2018,17 +1919,7 @@ mod tests {
         let g = ApexGenome::default();
         let mut rng = Rng64::new(1, 0);
         let mut p = MovePlanner::new(&mut rng);
-        let d = run(
-            &mut p,
-            &o,
-            &Mock::open(),
-            &mem(),
-            &g,
-            Mode::Home,
-            None,
-            None,
-            &[],
-        );
+        let d = run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::Home, None, None, &[]);
         assert!(norm(d.move_dir)[0] > 0.9, "{:?}", d.move_dir);
     }
 
@@ -2040,11 +1931,7 @@ mod tests {
         for i in 0..10 {
             o.projectiles.push(ProjectileObs {
                 id: i,
-                kind: if i % 3 == 0 {
-                    ProjectileKind::Mortar
-                } else {
-                    ProjectileKind::Gun
-                },
+                kind: if i % 3 == 0 { ProjectileKind::Mortar } else { ProjectileKind::Gun },
                 pos: [100.0 + i as f64, 10.0 * i as f64, 6.0],
                 vel: [-200.0, 0.0, 2.0],
             });
@@ -2073,14 +1960,11 @@ mod tests {
         };
         let mut tg = charger_at_us();
         tg.pos = [80.0, 0.0, 0.0];
-        let others = [
-            tg,
-            threat(2, [0.0, 90.0, 0.0], [None, None]),
-            threat(3, [-50.0, -50.0, 0.0], [None, None]),
-        ];
+        let others = [tg, threat(2, [0.0, 90.0, 0.0], [None, None]), threat(3, [-50.0, -50.0, 0.0], [None, None])];
         let m = Mem {
             last_dmg: 99.95,
             cubes: vec![[3.0, 3.0]],
+            ffa: false,
         };
         let mut r1 = Rng64::new(5, 2);
         let mut r2 = Rng64::new(5, 2);
@@ -2090,37 +1974,184 @@ mod tests {
         let start = std::time::Instant::now();
         for i in 0..n {
             o.t = 100.0 + i as f64 * DT;
-            let a = p1.plan_core(
-                &o,
-                &env,
-                &m,
-                &g,
-                Mode::Fight,
-                None,
-                Some(&tg),
-                &others,
-                true,
-                true,
-                &mut r1,
-            );
-            let b = p2.plan_core(
-                &o,
-                &env,
-                &m,
-                &g,
-                Mode::Fight,
-                None,
-                Some(&tg),
-                &others,
-                true,
-                true,
-                &mut r2,
-            );
+            let a = p1.plan_core(&o, &env, &m, &g, Mode::Fight, None, Some(&tg), &others, true, true, false, &mut r1);
+            let b = p2.plan_core(&o, &env, &m, &g, Mode::Fight, None, Some(&tg), &others, true, true, false, &mut r2);
             assert_eq!(a, b);
         }
         let per = start.elapsed().as_secs_f64() / (2 * n) as f64;
         // Loose bound so a busy machine does not flake; release measures well under 0.4 ms.
         let limit = if cfg!(debug_assertions) { 2e-2 } else { 2e-3 };
         assert!(per < limit, "{:.3} ms per plan", per * 1e3);
+    }
+
+    #[test]
+    fn open_field_fight_ignores_laser_peek() {
+        let mut o = obs();
+        give(&mut o, 0, WeaponKind::Laser);
+        let tg = threat(1, [100.0, 0.0, 0.0], [Some(WeaponKind::Gun), None]);
+        let body = [100.0, 0.0, 0.5 * o.me.stats.height];
+        // Nothing to peek from in the open; a wall edge in reach is.
+        assert!(!peek_edge_nearby(&Mock::open(), o.me.pos, o.me.stats.eye_height, body, &mut NO_HINT.clone()));
+        let walled = Mock {
+            half: 200.0,
+            walls: vec![[8.0, -1.0, 10.0, 30.0]],
+        };
+        assert!(peek_edge_nearby(&walled, o.me.pos, o.me.stats.eye_height, body, &mut NO_HINT.clone()));
+        // Laser cooling down, target in sight, open field: same move as without
+        // laser_peek, and a full-speed one.
+        for los in [true, false] {
+            let plan = |peek: bool| {
+                let g = ApexGenome {
+                    laser_peek: peek,
+                    laser_range: 100.0,
+                    ..ApexGenome::default()
+                };
+                let mut rng = Rng64::new(1, 0);
+                let mut p = MovePlanner::new(&mut rng);
+                p.plan_core(&o, &Mock::open(), &mem(), &g, Mode::Fight, None, Some(&tg), &[tg], los, false, false, &mut rng)
+            };
+            let (with, without) = (plan(true), plan(false));
+            assert_eq!(with, without, "los={los}");
+            assert!(with.move_dir[0].hypot(with.move_dir[1]) > 0.99, "{:?}", with.move_dir);
+        }
+    }
+
+    #[test]
+    fn practice_finish_close_and_crowd_standoff() {
+        let g = ApexGenome {
+            gun_range: 50.0,
+            laser_range: 120.0,
+            cdwin_push: false,
+            ..ApexGenome::default()
+        };
+        let mut o = obs();
+        give(&mut o, 0, WeaponKind::Gun);
+        let weak = ThreatInfo {
+            hp: 400.0,
+            ..threat(1, [80.0, 0.0, 0.0], [Some(WeaponKind::Gun), None])
+        };
+        assert_eq!(preferred_range(&o, false, &g, &weak, &[weak]).pref, 22.0);
+        // Not in FFA, not when we are hurt, not when far, not with a watcher near.
+        assert_eq!(preferred_range(&o, true, &g, &weak, &[weak]).pref, 50.0);
+        o.me.hp = 500.0;
+        assert_eq!(preferred_range(&o, false, &g, &weak, &[weak]).pref, 50.0);
+        o.me.hp = 1400.0;
+        let far = ThreatInfo { dist: 95.0, ..weak };
+        assert_eq!(preferred_range(&o, false, &g, &far, &[far]).pref, 50.0);
+        let watcher = threat(2, [0.0, 120.0, 0.0], [None, None]);
+        assert_eq!(preferred_range(&o, false, &g, &weak, &[weak, watcher]).pref, 50.0);
+        // A ghost or stale threat is no watcher.
+        let ghost = ThreatInfo { is_ghost: true, ..watcher };
+        let stale = ThreatInfo {
+            last_seen_t: o.t - 5.0,
+            ..watcher
+        };
+        assert_eq!(preferred_range(&o, false, &g, &weak, &[weak, ghost, stale]).pref, 22.0);
+
+        // Gun against a laser in Practice keeps out of the open-range duel; in FFA shifts to 95..130 m standoff.
+        let laser = threat(1, [80.0, 0.0, 0.0], [Some(WeaponKind::Laser), None]);
+        assert_eq!(preferred_range(&o, false, &g, &laser, &[laser]).pref, 95.0);
+        assert_eq!(preferred_range(&o, true, &g, &laser, &[laser]).pref, 95.0);
+
+        // Threats within 150-160 m in FFA: stand off in 95..130 m.
+        let plain = threat(1, [80.0, 0.0, 0.0], [Some(WeaponKind::Gun), None]);
+        let crowd = [plain, threat(2, [0.0, 120.0, 0.0], [None, None]), threat(3, [-130.0, 0.0, 0.0], [None, None])];
+        assert_eq!(preferred_range(&o, true, &g, &plain, &crowd).pref, 115.0);
+        assert_eq!(preferred_range(&o, true, &g, &plain, &crowd[..2]).pref, 95.0);
+        give(&mut o, 1, WeaponKind::Laser);
+        assert_eq!(preferred_range(&o, true, &g, &plain, &crowd).pref, 120.0);
+        // Lightning on a nearly dead target keeps brawling through the crowd.
+        give(&mut o, 1, WeaponKind::Lightning);
+        let dying = ThreatInfo { hp: 300.0, ..plain };
+        let crowd = [dying, crowd[1], crowd[2]];
+        let b = preferred_range(&o, true, &g, &dying, &crowd);
+        assert!(b.lightning && b.pref == 28.0, "{b:?}");
+        assert_eq!(preferred_range(&o, true, &g, &plain, &[plain, crowd[1], crowd[2]]).pref, 115.0);
+    }
+
+    #[test]
+    fn ffa_keeps_apart_and_home_holds_still() {
+        let g = ApexGenome {
+            quiet_walk: false,
+            ..ApexGenome::default()
+        };
+        let ffa = Mem { ffa: true, ..mem() };
+        let near = threat(2, [40.0, 0.0, 0.0], [Some(WeaponKind::Gun), None]);
+        let mut rng = Rng64::new(1, 0);
+        let mut p = MovePlanner::new(&mut rng);
+        // FFA: back away from a close threat; outside FFA stay put.
+        let d = run(&mut p, &obs(), &Mock::open(), &ffa, &g, Mode::Explore, None, None, &[near]);
+        assert!(d.move_dir[0] < -0.5, "{:?}", d.move_dir);
+        let d = run(&mut p, &obs(), &Mock::open(), &mem(), &g, Mode::Explore, None, None, &[near]);
+        assert_eq!(d.move_dir, [0.0, 0.0]);
+        // FFA: break its line of sight behind a wall when one is in reach.
+        let cover = Mock {
+            half: 200.0,
+            walls: vec![[6.0, 4.0, 9.0, 30.0]],
+        };
+        let d = run(&mut p, &obs(), &cover, &ffa, &g, Mode::Explore, None, None, &[near]);
+        let traj = simulate(&cover, &kin(&obs()), norm(d.move_dir), false);
+        let e = traj.end();
+        assert!(
+            !cover.los([40.0, 0.0, 8.0], [e[0], e[1], 4.5], &mut NO_HINT.clone()),
+            "{:?} -> {e:?}",
+            d.move_dir
+        );
+
+        // Home in reach, beside a wall: the hold bonus outweighs the small
+        // clearance gain of edging away; Explore edges away.
+        let wall = Mock {
+            half: 200.0,
+            walls: vec![[3.0, -10.0, 5.0, 10.0]],
+        };
+        let home = NavGoal {
+            pos: [0.0, 0.0, 0.0],
+            radius: 8.0,
+            exact: false,
+        };
+        let d = run(&mut p, &obs(), &wall, &mem(), &g, Mode::Explore, Some(home), None, &[]);
+        assert!(d.move_dir != [0.0, 0.0]);
+        let d = run(&mut p, &obs(), &wall, &mem(), &g, Mode::Home, Some(home), None, &[]);
+        assert_eq!(d.move_dir, [0.0, 0.0]);
+        // A visible threat with LOS within 130 m cancels the hold; a stale track < 130 m still freezes [0, 0].
+        let mut stale = threat(2, [-100.0, 0.0, 0.0], [None, None]);
+        stale.visible_now = false;
+        stale.last_seen_t = obs().t - 10.0;
+        let d = run(&mut p, &obs(), &wall, &ffa, &g, Mode::Home, Some(home), None, &[stale]);
+        assert_eq!(d.move_dir, [0.0, 0.0], "home_hold freezes even with stale tracks < 130 m");
+        assert!(!d.boost && !d.jump);
+        let watcher = threat(2, [-100.0, 0.0, 0.0], [None, None]);
+        let d = run(&mut p, &obs(), &wall, &ffa, &g, Mode::Home, Some(home), None, &[watcher]);
+        assert!(d.move_dir != [0.0, 0.0]);
+    }
+
+    #[test]
+    fn final_shrink_holds_the_center() {
+        let g = ApexGenome {
+            quiet_walk: false,
+            ..ApexGenome::default()
+        };
+        let mut o = obs();
+        o.me.pos = [15.0, 0.0, 0.0];
+        o.zone.next_center = [20.0, 0.0];
+        // Home wanders off toward a goal behind us.
+        let goal = NavGoal {
+            pos: [-30.0, 0.0, 0.0],
+            radius: 2.0,
+            exact: false,
+        };
+        let mut rng = Rng64::new(1, 0);
+        let mut p = MovePlanner::new(&mut rng);
+        o.zone.next_radius = 13.0;
+        let d = run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::Home, Some(goal), None, &[]);
+        assert!(d.move_dir[0] < -0.5, "{:?}", d.move_dir);
+        // The final shrink pins it to the center instead.
+        o.zone.next_radius = 10.0;
+        let d = run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::Home, Some(goal), None, &[]);
+        assert!(d.move_dir[0] > 0.5, "{:?}", d.move_dir);
+        // On the center it stays.
+        o.me.pos = [20.0, 0.0, 0.0];
+        let d = run(&mut p, &o, &Mock::open(), &mem(), &g, Mode::Home, Some(goal), None, &[]);
+        assert_eq!(d.move_dir, [0.0, 0.0]);
     }
 }

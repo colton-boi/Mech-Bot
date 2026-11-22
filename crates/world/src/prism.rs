@@ -55,63 +55,27 @@ fn make_runs(k: usize, poly: &[[f64; 2]], out: &mut Vec<Run>) {
     let n = poly.len();
     for start in (0..n).step_by(RUN) {
         let end = (start + RUN).min(n);
-        let mut bbox = [
-            f64::INFINITY,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::NEG_INFINITY,
-        ];
+        let mut bbox = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
         for i in start..=end {
             let p = poly[(i + n - 1) % n];
-            bbox = [
-                bbox[0].min(p[0]),
-                bbox[1].min(p[1]),
-                bbox[2].max(p[0]),
-                bbox[3].max(p[1]),
-            ];
+            bbox = [bbox[0].min(p[0]), bbox[1].min(p[1]), bbox[2].max(p[0]), bbox[3].max(p[1])];
             let q = poly[i % n];
-            bbox = [
-                bbox[0].min(q[0]),
-                bbox[1].min(q[1]),
-                bbox[2].max(q[0]),
-                bbox[3].max(q[1]),
-            ];
+            bbox = [bbox[0].min(q[0]), bbox[1].min(q[1]), bbox[2].max(q[0]), bbox[3].max(q[1])];
         }
         out.push(Run {
             poly: k,
             start,
             end,
-            bbox: [
-                bbox[0] - RUN_SLACK,
-                bbox[1] - RUN_SLACK,
-                bbox[2] + RUN_SLACK,
-                bbox[3] + RUN_SLACK,
-            ],
+            bbox: [bbox[0] - RUN_SLACK, bbox[1] - RUN_SLACK, bbox[2] + RUN_SLACK, bbox[3] + RUN_SLACK],
         });
     }
 }
 
 impl Prism {
-    pub fn new(
-        kind: PrismKind,
-        base: f64,
-        top: f64,
-        ring: Vec<[f64; 2]>,
-        holes: Vec<Vec<[f64; 2]>>,
-    ) -> Prism {
-        let mut bbox = [
-            f64::INFINITY,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::NEG_INFINITY,
-        ];
+    pub fn new(kind: PrismKind, base: f64, top: f64, ring: Vec<[f64; 2]>, holes: Vec<Vec<[f64; 2]>>) -> Prism {
+        let mut bbox = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
         for p in &ring {
-            bbox = [
-                bbox[0].min(p[0]),
-                bbox[1].min(p[1]),
-                bbox[2].max(p[0]),
-                bbox[3].max(p[1]),
-            ];
+            bbox = [bbox[0].min(p[0]), bbox[1].min(p[1]), bbox[2].max(p[0]), bbox[3].max(p[1])];
         }
         let mut runs = Vec::new();
         for (k, poly) in std::iter::once(&ring).chain(&holes).enumerate() {
@@ -130,13 +94,7 @@ impl Prism {
 
     /// An axis-aligned box, for tests and synthetic worlds.
     pub fn rect(kind: PrismKind, min: [f64; 2], max: [f64; 2], base: f64, top: f64) -> Prism {
-        Prism::new(
-            kind,
-            base,
-            top,
-            vec![min, [max[0], min[1]], max, [min[0], max[1]]],
-            Vec::new(),
-        )
+        Prism::new(kind, base, top, vec![min, [max[0], min[1]], max, [min[0], max[1]]], Vec::new())
     }
 
     /// True when `(x, y)` is inside the ring and outside every hole.
@@ -174,20 +132,13 @@ impl Prism {
 
     /// The wall segments near the 2D segment `a -> b`: every edge whose run box
     /// the segment crosses. All the others miss it.
-    pub(crate) fn edges_near(
-        &self,
-        a: [f64; 2],
-        b: [f64; 2],
-    ) -> impl Iterator<Item = ([f64; 2], [f64; 2])> + '_ {
+    pub(crate) fn edges_near(&self, a: [f64; 2], b: [f64; 2]) -> impl Iterator<Item = ([f64; 2], [f64; 2])> + '_ {
         let d = [b[0] - a[0], b[1] - a[1]];
         self.runs
             .iter()
             .filter(move |r| {
                 let (mut t0, mut t1) = (0.0f64, 1.0f64);
-                for (p, dp, lo, hi) in [
-                    (a[0], d[0], r.bbox[0], r.bbox[2]),
-                    (a[1], d[1], r.bbox[1], r.bbox[3]),
-                ] {
+                for (p, dp, lo, hi) in [(a[0], d[0], r.bbox[0], r.bbox[2]), (a[1], d[1], r.bbox[1], r.bbox[3])] {
                     if dp == 0.0 {
                         if p < lo || p > hi {
                             return false;
@@ -289,9 +240,6 @@ impl Prism {
 
     /// True when the footprint's bounding box comes within `r` of `(x, y)`.
     pub fn bbox_near(&self, x: f64, y: f64, r: f64) -> bool {
-        x >= self.bbox[0] - r
-            && x <= self.bbox[2] + r
-            && y >= self.bbox[1] - r
-            && y <= self.bbox[3] + r
+        x >= self.bbox[0] - r && x <= self.bbox[2] + r && y >= self.bbox[1] - r && y <= self.bbox[3] + r
     }
 }

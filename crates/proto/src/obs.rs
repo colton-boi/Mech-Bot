@@ -95,10 +95,7 @@ impl WeaponObs {
     /// Seconds until it can fire again.
     pub fn cooldown(&self) -> f64 {
         match self {
-            Self::Gun { cooldown, .. }
-            | Self::Mortar { cooldown, .. }
-            | Self::Laser { cooldown, .. }
-            | Self::Lightning { cooldown, .. } => *cooldown,
+            Self::Gun { cooldown, .. } | Self::Mortar { cooldown, .. } | Self::Laser { cooldown, .. } | Self::Lightning { cooldown, .. } => *cooldown,
         }
     }
 }

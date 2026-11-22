@@ -25,15 +25,8 @@ impl Session {
             .stderr(Stdio::null())
             .spawn()
             .expect("the bot starts");
-        let (stdin, stdout) = (
-            child.stdin.take().unwrap(),
-            BufReader::new(child.stdout.take().unwrap()),
-        );
-        Session {
-            child,
-            stdin,
-            stdout,
-        }
+        let (stdin, stdout) = (child.stdin.take().unwrap(), BufReader::new(child.stdout.take().unwrap()));
+        Session { child, stdin, stdout }
     }
 
     fn send(&mut self, text: &str) {
@@ -44,8 +37,7 @@ impl Session {
     fn reply(&mut self) -> Value {
         let mut line = String::new();
         self.stdout.read_line(&mut line).unwrap();
-        serde_json::from_str(&line)
-            .unwrap_or_else(|e| panic!("stdout carried a non-message {line:?}: {e}"))
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("stdout carried a non-message {line:?}: {e}"))
     }
 }
 
@@ -67,31 +59,16 @@ fn it_survives_bad_input_answers_only_the_newest_observation_and_exits_on_end() 
     bot.send(&obs(2));
     let first = bot.reply();
     assert_eq!(first["tick"], 2);
-    assert_eq!(
-        first["move"],
-        json!([1.0, 0.0]),
-        "it heads for the next circle, east"
-    );
+    assert_eq!(first["move"], json!([1.0, 0.0]), "it heads for the next circle, east");
 
     bot.send("this is not json\n\n{\"type\":\"weather\",\"rain\":true}\n");
     bot.send(&format!("{}{}{}", obs(4), obs(6), obs(8)));
-    assert_eq!(
-        bot.reply()["tick"],
-        8,
-        "queued observations: only the newest is answered"
-    );
+    assert_eq!(bot.reply()["tick"], 8, "queued observations: only the newest is answered");
 
     bot.send("{\"type\":\"obs\",\"tick\":10,\"self\":\"garbled\"}\n");
     let coasted = bot.reply();
-    assert_eq!(
-        coasted["tick"], 10,
-        "an observation it cannot read still gets an answer"
-    );
-    assert_eq!(
-        coasted["move"],
-        json!([1.0, 0.0]),
-        "it coasts on its last move"
-    );
+    assert_eq!(coasted["tick"], 10, "an observation it cannot read still gets an answer");
+    assert_eq!(coasted["move"], json!([1.0, 0.0]), "it coasts on its last move");
 
     bot.send(&obs(12));
     assert_eq!(bot.reply()["tick"], 12, "and it recovers");
@@ -126,16 +103,8 @@ fn bad_params_files_and_unknown_policies_still_play() {
     let unknown = dir.join("unknown.json");
     std::fs::write(&unknown, "{\"no_such_param\": 1}").unwrap();
     let missing = dir.join("missing.json");
-    for (policy, params) in [
-        ("aggro", &garbled),
-        ("aggro", &unknown),
-        ("aggro", &missing),
-        ("no-such-policy", &garbled),
-    ] {
-        let mut bot = Session::with_env(&[
-            ("MECH_POLICY", policy),
-            ("MECH_PARAMS", params.to_str().unwrap()),
-        ]);
+    for (policy, params) in [("aggro", &garbled), ("aggro", &unknown), ("aggro", &missing), ("no-such-policy", &garbled)] {
+        let mut bot = Session::with_env(&[("MECH_POLICY", policy), ("MECH_PARAMS", params.to_str().unwrap())]);
         bot.send(HELLO_NO_MAP);
         assert_eq!(bot.reply()["type"], "ready", "{policy} {params:?}");
         bot.send(&obs(2));
@@ -145,10 +114,7 @@ fn bad_params_files_and_unknown_policies_still_play() {
     }
     let good = dir.join("good.json");
     std::fs::write(&good, "{\"aggro_close_dist\": 45}").unwrap();
-    let mut bot = Session::with_env(&[
-        ("MECH_POLICY", "survive"),
-        ("MECH_PARAMS", good.to_str().unwrap()),
-    ]);
+    let mut bot = Session::with_env(&[("MECH_POLICY", "survive"), ("MECH_PARAMS", good.to_str().unwrap())]);
     bot.send(HELLO_NO_MAP);
     assert_eq!(bot.reply()["name"], "cbot");
     bot.send(&obs(2));

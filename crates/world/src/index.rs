@@ -95,19 +95,14 @@ impl Grid {
     fn cells_of(&self, b: &[f64; 4]) -> Vec<usize> {
         let (i0, j0) = self.cell_xy(b[0] - MARGIN, b[1] - MARGIN);
         let (i1, j1) = self.cell_xy(b[2] + MARGIN, b[3] + MARGIN);
-        (j0..=j1)
-            .flat_map(|j| (i0..=i1).map(move |i| j * self.nx + i))
-            .collect()
+        (j0..=j1).flat_map(|j| (i0..=i1).map(move |i| j * self.nx + i)).collect()
     }
 
     /// Cells the segment's footprint crosses, in order. Every object lies
     /// inside the grid, so the parts of a segment outside it touch nothing and
     /// are clipped off first.
     fn walk(&self, a: Vec3, b: Vec3, mut visit: impl FnMut(usize) -> bool) {
-        let (gx1, gy1) = (
-            self.min_x + self.nx as f64 * CELL,
-            self.min_y + self.ny as f64 * CELL,
-        );
+        let (gx1, gy1) = (self.min_x + self.nx as f64 * CELL, self.min_y + self.ny as f64 * CELL);
         let d = [b[0] - a[0], b[1] - a[1]];
         let (mut t0, mut t1) = (0.0f64, 1.0f64);
         for (p, dp, lo, hi) in [(a[0], d[0], self.min_x, gx1), (a[1], d[1], self.min_y, gy1)] {
@@ -136,9 +131,7 @@ impl Grid {
         } else {
             (0.0, 0.0)
         };
-        let next_edge = |c: usize, step: isize, min: f64| {
-            min + (c as f64 + if step > 0 { 1.0 } else { 0.0 }) * CELL
-        };
+        let next_edge = |c: usize, step: isize, min: f64| min + (c as f64 + if step > 0 { 1.0 } else { 0.0 }) * CELL;
         let mut t_max_x = if ux.abs() > 1e-12 {
             (next_edge(i, step_i, self.min_x) - start[0]) / ux
         } else {
@@ -149,16 +142,8 @@ impl Grid {
         } else {
             f64::INFINITY
         };
-        let t_dx = if ux.abs() > 1e-12 {
-            CELL / ux.abs()
-        } else {
-            f64::INFINITY
-        };
-        let t_dy = if uy.abs() > 1e-12 {
-            CELL / uy.abs()
-        } else {
-            f64::INFINITY
-        };
+        let t_dx = if ux.abs() > 1e-12 { CELL / ux.abs() } else { f64::INFINITY };
+        let t_dy = if uy.abs() > 1e-12 { CELL / uy.abs() } else { f64::INFINITY };
         let max_steps = self.nx + self.ny + 2;
         for _ in 0..max_steps {
             if !visit(j * self.nx + i) || (i == ie && j == je) {
@@ -201,12 +186,7 @@ impl Grid {
 
     /// The first prism, registered in a cell the segment crosses, for which
     /// `hit` is true. Cells are visited from `a` toward `b` and the walk stops there.
-    pub(crate) fn find_prism_on(
-        &self,
-        a: Vec3,
-        b: Vec3,
-        mut hit: impl FnMut(usize) -> bool,
-    ) -> Option<usize> {
+    pub(crate) fn find_prism_on(&self, a: Vec3, b: Vec3, mut hit: impl FnMut(usize) -> bool) -> Option<usize> {
         // Prisms already tested, kept on the stack; past its size a repeat test is only wasted work.
         let mut tested = [u32::MAX; 48];
         let mut n = 0;
@@ -268,12 +248,7 @@ impl World {
 
     /// [`World::prisms_near`] through the grid: the prisms whose bounding box
     /// comes within `r` of `(x, y)`, ascending, with their indices.
-    pub fn prisms_near_indexed(
-        &self,
-        x: f64,
-        y: f64,
-        r: f64,
-    ) -> impl Iterator<Item = (usize, &crate::Prism)> {
+    pub fn prisms_near_indexed(&self, x: f64, y: f64, r: f64) -> impl Iterator<Item = (usize, &crate::Prism)> {
         let mut ids: Vec<u32> = Vec::new();
         match self.grid() {
             Some(g) => {
@@ -315,16 +290,12 @@ impl World {
     /// [`World::surface_at`] through the grid, with the same answer.
     pub fn surface_at_indexed(&self, x: f64, y: f64, z_max: f64) -> f64 {
         let ground = self.terrain.height(x, y);
-        self.roof_at_indexed(x, y, z_max)
-            .map_or(ground, |roof| roof.max(ground))
+        self.roof_at_indexed(x, y, z_max).map_or(ground, |roof| roof.max(ground))
     }
 
     /// [`World::solid_at`] through the grid, with the same answer.
     pub fn solid_at_indexed(&self, p: Vec3) -> bool {
-        p[2] < self.terrain.height(p[0], p[1])
-            || self
-                .prisms_at(p[0], p[1])
-                .any(|(_, prism)| prism.contains(p))
+        p[2] < self.terrain.height(p[0], p[1]) || self.prisms_at(p[0], p[1]).any(|(_, prism)| prism.contains(p))
     }
 }
 
