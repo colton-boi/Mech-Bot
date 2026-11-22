@@ -1,6 +1,9 @@
-# Build from this folder: docker build -t my-bot .
-# The match runs it with no network, a read-only root (writable /tmp), 1 CPU, 512 MB, and the map at /arena.
-FROM python:3.13-slim
-WORKDIR /bot
-COPY . .
-ENTRYPOINT ["python3", "-u", "/bot/bot.py"]
+FROM rust:1-alpine AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release --locked -p bot && strip /src/target/release/bot
+
+FROM scratch
+COPY --from=build /src/target/release/bot /bot
+ENTRYPOINT ["/bot"]
